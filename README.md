@@ -10,13 +10,13 @@ BaradWatchU is an endpoint security compliance auditing platform. The server wil
 
 **Implemented in L0.1:** Rust/Axum HTTP service source with `GET /health`; Angular 18 dashboard scaffold that clearly reports that fleet data is unavailable.
 
-**Implemented in L0.1.1:** product version `0.0.1`; Rust `--version`/`-V` and `--help`/`-h`; a Linux source-installer foundation with dependency audit, dry-run, build-cache validation, user/system prefixes and hash-manifest uninstall. Installer/service lifecycle and actual release artifacts remain unverified; no distribution channel is claimed as production-ready.
+**Validated in L0.1.1:** version `0.0.1`, Rust CLI, debug/release builds and Angular production build. Regression tests cover startup and version metadata. The installer was checked with isolated caches and prefixes for install/update/uninstall; its complete build reaches the Rust stage, while npm installation in a fresh cache is blocked in the offline environment. System services and native packages remain planned.
 
 **Planned:** authenticated enrollment, policy assignment, audit ingestion and history, device inventory, reporting, and SQLite persistence behind a storage boundary that can later support PostgreSQL. None of these features are implemented yet.
 
 ## Architecture
 
-- `crates/server`: Rust service binary; `src/main.rs` owns HTTP startup and health route; `src/storage.rs` marks the persistence boundary without an implementation.
+- `crates/server`: Rust service binary; `src/main.rs` owns process/runtime/signal handling; `src/config.rs` validates startup configuration; `src/http.rs` defines the testable router; `src/storage.rs` marks the persistence boundary without an implementation.
 - `web`: Angular dashboard, built separately and not yet served by the Rust process.
 - Future API areas: enrollment, policies, audit ingestion, inventory and reporting. No placeholder business endpoints are exposed.
 - SQLite is the planned initial database; schema and adapter work is deferred until persistence is in scope.
@@ -35,9 +35,10 @@ The release executable supports the same flags without starting the HTTP server.
 ## Prerequisites
 
 - Rust stable toolchain with Cargo and rustfmt (workspace baseline: Rust 1.80+).
-- Node.js 20.11+ and npm 8+ for Angular 18 (Node 20 recommended).
+- Node.js 20.11.1 or later within Node 20 and npm 8+; `web/.nvmrc` selects Node 20. Commands reject incompatible Node versions with an actionable message.
 - Network access on first dependency resolution unless dependencies are already cached.
-- GNU/Linux with glibc 2.17+ for this source-build target.
+- GNU/Linux with glibc 2.17+ to build; a cache records the actual build host glibc and conservatively requires the same or a newer version.
+- For the full source build: C/C++ compilers, make, Python 3 and tar (including native npm dependency fallbacks).
 
 ## Commands
 
@@ -45,25 +46,31 @@ From the repository root:
 
 ```sh
 cargo fmt --all -- --check
-cargo test --workspace
+cargo test --workspace --locked
+cargo build --workspace --locked
+cargo build --release --workspace --locked
 cargo run -p baradwatchu-server
 cargo run -p baradwatchu-server -- --version
 cargo run -p baradwatchu-server -- --help
 ```
 
-The service listens on `127.0.0.1:3000` by default; set `BARADWATCHU_SERVER_ADDR` to override. Check `http://127.0.0.1:3000/health` for JSON health status.
+The service listens on `127.0.0.1:3000` by default; set `BARADWATCHU_SERVER_ADDR` to an IP address and port to override (IPv6: `[::1]:3000`). Configuration/bind errors return exit 1, invalid CLI arguments return 2; Ctrl-C/SIGTERM initiates graceful shutdown. Check `http://127.0.0.1:3000/health` for JSON health status.
 
 Build the dashboard separately:
 
 ```sh
 cd web
-npm install
-npm run build
+npm ci
+npm start       # local development
+npm test        # version tooling tests
+npm run build   # production
 ```
+
+If using nvm, run `nvm use` in `web/` before npm commands. The development UI listens at `http://127.0.0.1:4200` and remains independent of the Rust process. `npm start` stays in the foreground; stop it with Ctrl-C before running other commands in that terminal.
 
 ## Linux source installation
 
-Supported installer detection: Arch Linux, Fedora, Debian and Ubuntu, including `ID_LIKE`. `--missing-deps` only inspects dependencies, reports missing local Angular packages and prints package-manager/project commands; it never installs system packages. Required source-build tools are Rust/Cargo 1.80+, Node.js 20.11+ and npm 8+; glibc 2.17+ is the GNU/Linux runtime baseline. A validated prebuilt cache does not require Node/Angular tooling, but this source installer builds those assets when building from source.
+Supported installer detection: Arch Linux, Fedora, Debian and Ubuntu, including `ID_LIKE`. `--missing-deps` only inspects dependencies, reports missing local Angular packages and prints package-manager/project commands; it never installs system packages. Required source-build tools are Rust/Cargo 1.80+, Node.js 20 >=20.11.1, npm 8+, C/C++, make, Python 3 and tar; glibc 2.17+ is the minimum checked on the build host. A validated prebuilt cache does not require Node/Angular tooling, but this source installer builds those assets when building from source.
 
 ```sh
 ./install.sh --help
@@ -77,11 +84,11 @@ sudo ./install.sh --no-build --build-dir="$HOME/.cache/baradwatchu/baradwatchu-s
 
 `--no-build` requires a complete cache created from this exact source tree, version and host platform. For a system prefix, build as an unprivileged user first, then run the install with `sudo` and `--no-build`; never build as root. `--local` installs under `~/.local` for manual development use. Neither mode creates a service or production configuration. Uninstall removes only unchanged payload files listed in the source manifest; it refuses package-manager-owned or modified files and preserves configuration/data. Updates use the same ownership manifest. No service is restarted.
 
-`--build-only` prepares and validates a cache without touching an installation. `-h` aliases `--help`, `-U` aliases `--uninstall`, and `--build-dir=DIR` selects the marked build cache. Exit codes are 0 for success, 1 for execution/validation failures, and 2 for invalid or conflicting options.
+`--build-only` uses Cargo `--locked` and a temporary Angular workspace inside the cache: `npm ci` does not replace checkout `node_modules`. Dependencies, npm logs and node-gyp headers stay in the cache. Sources must remain unchanged during the build. `-h` aliases `--help`, `-U` aliases `--uninstall`, and `--build-dir=DIR` selects the marked build cache. Exit codes are 0 for success, 1 for execution/validation failures, and 2 for invalid or conflicting options.
 
 Source installation builds from this checkout. Arch `pacman`, Debian/Ubuntu `.deb`, and Fedora `.rpm` are planned in [`packaging/README.md`](packaging/README.md); none has a package recipe/artifact yet. The source installer refuses to mix with package-manager ownership.
 
-No Angular test runner or tests are configured. Rust tests run with `cargo test --workspace`. In the initial environment, server and Angular builds could not complete because dependency registry access was unavailable; do not treat the source installer as end-to-end validated until real release builds pass.
+`cargo test --workspace --locked` runs 8 Rust tests; `npm test` runs 4 version tooling cases. No Angular UI test runner is configured. Formatting, Clippy and Rust/Angular builds are verified. Socket tests are blocked by the sandbox (`EPERM`); `npm start` is configured, but HTTP listening needs verification on the operator host. The Server enables Tokio I/O drivers, reports startup errors without panics, and implements graceful SIGINT/SIGTERM shutdown; the in-process `/health` router test passes, while live HTTP and connection draining remain unverified. Build cache v2 checks artifact hashes and glibc before reuse, without executing binaries in `--no-build`. Older caches require a rebuild; installed configuration and data are preserved.
 
 ## Security principles
 

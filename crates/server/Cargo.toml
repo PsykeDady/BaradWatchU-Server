@@ -10,3 +10,6 @@ axum.workspace = true
 serde.workspace = true
 tokio.workspace = true
 
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
