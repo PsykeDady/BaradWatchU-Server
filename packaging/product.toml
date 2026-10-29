@@ -1,0 +1,22 @@
+# Packaging inputs/ownership plan. Cargo.toml remains the only product version source.
+[product]
+name = "BaradWatchU Server"
+binary = "baradwatchu-server"
+version_source = "../Cargo.toml#[workspace.package].version"
+formats = ["linux-source", "arch-pacman", "debian-deb", "fedora-rpm"]
+
+[linux]
+binary_package_path = "/usr/bin/baradwatchu-server"
+binary_source_prefix_path = "/usr/local/bin/baradwatchu-server"
+web_assets_path = "/usr/share/baradwatchu-server/web"
+config_path = "/etc/baradwatchu/server"
+data_path = "/var/lib/baradwatchu/server"
+service_unit = "baradwatchu-server.service"
+service_status = "deferred"
+package_artifact_status = "planned-not-built-or-tested"
+
+[source_installer]
+script = "../install.sh"
+manifest = "share/baradwatchu-source/baradwatchu-server.manifest"
+manifest_hashes_payload = true
+preserve_config_and_data = true
