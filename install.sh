@@ -29,6 +29,7 @@ Usage: ./install.sh [OPTIONS]
       --prefix=DIR     Install prefix (default /usr/local)
   -U, --uninstall      Remove unchanged files listed in source manifest
 No package install, systemd unit creation, or service restart is performed.
+Runtime authentication is selected in config (LOCAL or OIDC); BARADWATCHU_SERVER_CONFIG overrides /etc/baradwatchu/server.json and user config. The installer does not write credentials or change mode.
 EOF
 }
 fail() { echo "Error: $*" >&2; exit 1; }
@@ -47,8 +48,8 @@ deps() {
         *' debian '*|*' ubuntu '*) family=Debian/Ubuntu; suggest='sudo apt update && sudo apt install build-essential python3 tar cargo rustc nodejs npm' ;;
     esac
     echo "Dependency audit: Server $VERSION ($family)"
-    if command -v rustc >/dev/null && rv=$(rustc --version|awk '{print $2}') && ge "$rv" 1.80.0; then echo "[ok] rustc $rv"; else echo '[missing] rustc >=1.80.0'; missing=1; fi
-    if command -v cargo >/dev/null && cv=$(cargo --version|awk '{print $2}') && ge "$cv" 1.80.0; then echo "[ok] Cargo $cv"; else echo '[missing] Cargo >=1.80.0'; missing=1; fi
+    if command -v rustc >/dev/null && rv=$(rustc --version|awk '{print $2}') && ge "$rv" 1.88.0; then echo "[ok] rustc $rv"; else echo '[missing] rustc >=1.88.0'; missing=1; fi
+    if command -v cargo >/dev/null && cv=$(cargo --version|awk '{print $2}') && ge "$cv" 1.88.0; then echo "[ok] Cargo $cv"; else echo '[missing] Cargo >=1.88.0'; missing=1; fi
     if command -v node >/dev/null && nv=$(node -p 'process.versions.node') && [[ "$nv" == 20.* ]] && ge "$nv" 20.11.1; then echo "[ok] Node.js $nv"; else echo '[missing] Node.js 20 >=20.11.1 (run nvm use in web/)'; missing=1; fi
     if command -v npm >/dev/null && np=$(npm --version) && ge "$np" 8.0.0; then echo "[ok] npm $np"; else echo '[missing] npm >=8.0.0'; missing=1; fi
     for tool in cc c++ make python3 tar; do
@@ -232,7 +233,7 @@ install_source() {
     { printf 'BaradWatchU source manifest v1\nserver\n%s\n%s\n' "$PREFIX" "$VERSION"; cat "$STAGE_DIR/manifest-entries"; } > "$STAGE_DIR/final-manifest"
     if ! install -m 0644 "$STAGE_DIR/final-manifest" "$tmp"; then unlink -- "$tmp"; fail 'could not stage source manifest'; fi
     if ! mv -f -- "$tmp" "$manifest"; then unlink -- "$tmp"; fail 'could not replace source manifest'; fi
-    echo "Installed BaradWatchU Server $VERSION. No packages/services were changed; configuration and user data were preserved."
+    echo "Installed BaradWatchU Server $VERSION. No packages/services or authentication settings were changed; configuration and user data were preserved."
 }
 
 while (($#)); do

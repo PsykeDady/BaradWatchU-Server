@@ -4,26 +4,40 @@
 
 [Leggi in italiano](LEGGIMI.md)
 
-BaradWatchU is an endpoint security compliance auditing platform. The server will manage device enrollment, desired policies, audit evidence, fleet inventory and reports; the independent client agent will collect local observations and later send them to this server.
+BaradWatchU Server coordinates consent-based workstation audits through the independent Client.
 
-## Status
+## Status and architecture
 
-**Implemented in L0.1:** Rust/Axum HTTP service source with `GET /health`; Angular 18 dashboard scaffold that clearly reports that fleet data is unavailable.
+The MVP uses the existing Rust/Axum backend and Angular 18 dashboard. Authentication is
+configurable: loopback-only LOCAL for development or Google OIDC Authorization Code + PKCE
+with backend cookie sessions and an explicit multi-admin allowlist. Both use the same manual
+Ed25519 pairing, trusted Client inventory, remote requests/status/results and JSON download.
+Client audit execution, consent and local history remain in the Client.
 
-**Validated in L0.1.1:** version `0.0.1`, Rust CLI, debug/release builds and Angular production build. Regression tests cover startup and version metadata. The installer was checked with isolated caches and prefixes for install/update/uninstall; its complete build reaches the Rust stage, while npm installation in a fresh cache is blocked in the offline environment. System services and native packages remain planned.
+- `crates/server/src/auth.rs`: Google discovery, code exchange and signed token validation;
+  tokens stay in the backend and are discarded. LOCAL creates only a loopback session with a
+  descriptive operator label. Cookies are Secure, HttpOnly, SameSite=Lax, host-only; mutations
+  require session CSRF token and exact Origin.
+- `storage.rs`: SQLite identity seed, trusted Client public keys/endpoints, administrators
+  keyed by Google issuer + subject (with latest verified display name/email). Owner-only
+  data directory (0700) and database (0600); no automatic identity generation.
+- `remote.rs`, `tls.rs`: existing Client protocol, TLS 1.3/raw Ed25519 keys, exact Client key
+  pinning and Device ID SNI. No TOFU, discovery or automatic pairing.
+- `http.rs`: protected fleet APIs and built Angular assets on the same origin. OIDC checks the
+  allowlist on each request; LOCAL relies on its enforced loopback listener. OIDC admin
+  revocation affects already-open sessions.
+- Sessions (8 hours) and routing records (24 hours; up to 4096 requests) are in memory and
+  lost on Server restart. No Server audit database: results are fetched from the Client,
+  which retains completed results for one hour in memory and keeps local history separately.
+  Each operator can retrieve their own requests. One Server process per data directory.
 
-**Planned:** authenticated enrollment, policy assignment, audit ingestion and history, device inventory, reporting, and SQLite persistence behind a storage boundary that can later support PostgreSQL. None of these features are implemented yet.
-
-## Architecture
-
-- `crates/server`: Rust service binary; `src/main.rs` owns process/runtime/signal handling; `src/config.rs` validates startup configuration; `src/http.rs` defines the testable router; `src/storage.rs` marks the persistence boundary without an implementation.
-- `web`: Angular dashboard, built separately and not yet served by the Rust process.
-- Future API areas: enrollment, policies, audit ingestion, inventory and reporting. No placeholder business endpoints are exposed.
-- SQLite is the planned initial database; schema and adapter work is deferred until persistence is in scope.
+Policy assignment/comparison, historical Server audit storage, scheduling, remediation,
+complex roles, multi-tenancy, discovery, native packages and Server service packaging remain
+outside this MVP. The source installer still does not create a system service.
 
 ## Version and CLI
 
-Server and Client have independent release lifecycles. The Server's authoritative product version is `[workspace.package].version` in this repository's root `Cargo.toml`; Rust packages inherit it. Angular `package.json` and the displayed dashboard version are generated/synchronized from that source by `node web/sync-version.mjs` (also run automatically by `npm run build`). Change the workspace version using SemVer, then run the sync command. Product version is independent of future API/protocol/schema versions; those contracts are not defined yet.
+Server and Client have independent release lifecycles. The Server's authoritative product version is `[workspace.package].version` in this repository's root `Cargo.toml`; Rust packages inherit it. Angular `package.json` and the displayed dashboard version are generated/synchronized from that source by `node web/sync-version.mjs` (also run automatically by `npm run build`). Change the workspace version using SemVer, then run the sync command. Product version is independent of API/protocol/schema versions; the remote protocol remains v1.
 
 ```sh
 cargo run -p baradwatchu-server -- --version
@@ -34,7 +48,7 @@ The release executable supports the same flags without starting the HTTP server.
 
 ## Prerequisites
 
-- Rust stable toolchain with Cargo and rustfmt (workspace baseline: Rust 1.80+).
+- Rust stable toolchain with Cargo and rustfmt (workspace baseline: Rust 1.88+).
 - Node.js 20.11.1 or later within Node 20 and npm 8+; `web/.nvmrc` selects Node 20. Commands reject incompatible Node versions with an actionable message.
 - Network access on first dependency resolution unless dependencies are already cached.
 - GNU/Linux with glibc 2.17+ to build; a cache records the actual build host glibc and conservatively requires the same or a newer version.
@@ -66,11 +80,159 @@ npm test        # version tooling tests
 npm run build   # production
 ```
 
-If using nvm, run `nvm use` in `web/` before npm commands. The development UI listens at `http://127.0.0.1:4200` and remains independent of the Rust process. `npm start` stays in the foreground; stop it with Ctrl-C before running other commands in that terminal.
+Use `nvm use` in `web/`. For the complete workflow, build Angular and open the Rust-served
+`http://localhost:3000`. Configuration is selected from `BARADWATCHU_SERVER_CONFIG` when
+set; otherwise the Server checks `/etc/baradwatchu/server.json`, then
+`$XDG_CONFIG_HOME/baradwatchu/server.json` (normally `~/.config/baradwatchu/server.json`).
+If no file exists, only `/health` is enabled. An explicitly selected or discovered file that
+exists but cannot be read causes startup to fail; the Server does not silently choose a
+different authentication mode.
+For Angular live development, `npm start` stays in the foreground on port 4200 and proxies
+`/api` and `/auth` to `127.0.0.1:3000`; use `http://localhost:4200` as `publicUrl`. OIDC also
+uses its matching Google callback; LOCAL needs no callback. Angular never starts Rust.
+
+## Authentication mode and local development
+
+Authentication mode is selected by `authMode` in `BARADWATCHU_SERVER_CONFIG`. Omitted
+`authMode` defaults to `OIDC`, preserving the Google login and explicit administrator
+allowlist. The source installer does not select a mode or write runtime configuration;
+`--local` selects only a user-local installation prefix.
+
+For development without OAuth credentials, create a private `server.local.json`:
+
+```json
+{
+  "authMode": "LOCAL",
+  "publicUrl": "http://localhost:3000",
+  "localOperatorName": "Mario Rossi"
+}
+```
+
+```sh
+chmod 600 server.local.json
+export BARADWATCHU_SERVER_CONFIG="$PWD/server.local.json"
+export BARADWATCHU_SERVER_ADDR=127.0.0.1:3000
+export BARADWATCHU_SERVER_DATA_DIR="$HOME/.local/state/baradwatchu-server"
+cargo run -p baradwatchu-server
+```
+
+Build the Angular dashboard with `(cd web && npm run build)` and open
+`http://localhost:3000`. Without `localOperatorName`, the Server uses `USER`, then
+`LOGNAME`/`USERNAME`, then the generic `Operatore locale` label. This is a descriptive label only:
+loopback access does not authenticate the browser user, and a system service may resolve
+its own service account. LOCAL requires `127.0.0.1` or `::1`, HTTP localhost public URL,
+and any port; startup fails on wildcard/non-loopback bindings. It trusts no Host or
+forwarded headers. Use it only on a trusted development/local machine; do not put it behind
+a public reverse proxy. Server identity pairing, Client mTLS, explicit consent and the
+Client's 120-second consent window are unchanged.
+
+To switch back, set `"authMode": "OIDC"` (or omit it) and restore the `google` block from
+`server.example.json` with real local credentials. Restart the Server. `/api/auth-mode`
+reports `OIDC`, `/api/session` returns 401 before Google login, and `/auth/login` starts the
+existing OIDC flow; the LOCAL session endpoint does not issue a session cookie in OIDC mode.
+
+## Google OAuth setup
+
+1. In Google Cloud Console, select/create a project. Open **Google Auth Platform → Branding**
+   and configure the application name, support email and contact email.
+2. Under **Audience**, choose **Internal** for your Workspace organization, where available;
+   otherwise use **External / Testing** and add both operators as test users.
+3. Under **Data Access**, configure only `openid`, `email`, `profile` (the console may show
+   the email/profile scopes as `userinfo.email` and `userinfo.profile`). No Workspace data
+   APIs or service accounts are required by this MVP.
+4. Under **Clients → Create client**, choose **Web application**. Add the exact authorized
+   redirect URI **`http://localhost:3000/auth/callback`**. This backend flow needs no JavaScript
+   origin registration. For a deployed instance, add `https://YOUR-SERVER/auth/callback`.
+5. Copy the client ID and secret into a private local configuration, never into Git. If your
+   organization restricts OAuth apps, its Workspace administrator must permit this client.
+
+Google permits HTTP localhost web-app redirects for development; a public domain is not
+required. See [Google's web-server flow](https://developers.google.com/identity/protocols/oauth2/web-server)
+and [consent configuration](https://developers.google.com/workspace/guides/configure-oauth-consent).
+
+```sh
+cp server.example.json server.local.json
+chmod 600 server.local.json
+# Edit the placeholders; set workspaceDomain to your Workspace domain or omit it.
+export BARADWATCHU_SERVER_CONFIG="$PWD/server.local.json"
+export BARADWATCHU_SERVER_DATA_DIR="$HOME/.local/state/baradwatchu-server"
+cargo build --workspace --locked
+(cd web && npm run build)
+cargo run -p baradwatchu-server
+```
+
+`server.local.json` is ignored by Git. In OIDC mode, `publicUrl` must be an HTTPS origin,
+except exact HTTP `localhost` with a loopback backend bind. `google.redirectUri` must equal
+`publicUrl/auth/callback`. Optional `webDir` overrides the built dashboard directory; by
+default the installed `share/baradwatchu-server/web` or checkout build is used. Google
+configuration is read at startup; restart after changes. `workspaceDomain` checks the signed
+`hd` claim, not an email suffix; it never grants administrator authorization.
+
+Secure cookies are retained on localhost (verified with Chrome); browsers that do not
+support this localhost exception need local HTTPS. Outside local development, place a TLS
+reverse proxy in front of the loopback backend and expose only the configured HTTPS origin.
+Proxy all routes without changing paths. Do not expose the backend HTTP listener directly.
+The Server does not trust forwarded headers to determine its public origin.
+
+## First administrator and additional administrators
+
+Sign in through the dashboard. A valid Google user not on the allowlist sees only their
+verified issuer/subject and an authorization-required screen. There is no registration API.
+As the local OS account that owns the Server data directory, run:
+
+```sh
+# Keep BARADWATCHU_SERVER_DATA_DIR identical to the running Server's value.
+./target/debug/baradwatchu-server setup admin allow GOOGLE_SUBJECT_ONE
+./target/debug/baradwatchu-server setup admin allow GOOGLE_SUBJECT_TWO
+# Revocation takes effect on the next API request, without restarting.
+./target/debug/baradwatchu-server setup admin revoke GOOGLE_SUBJECT_ONE
+```
+
+The issuer is fixed to `https://accounts.google.com`; copy each `sub` from its authenticated
+screen. Names/emails are informational and refreshed after login. Both allowlisted operators
+may request audits; sign out ends only the BaradWatchU session, not the Google account session.
+After granting access, use **Check authorization again** (or sign in again). These small local
+provisioning commands also work with the installed `baradwatchu-server` binary.
+
+## Manual pairing and audit workflow
+
+Generate the Server identity through the authorized dashboard, or explicitly:
+
+```sh
+./target/debug/baradwatchu-server setup identity generate "Company Server"
+./target/debug/baradwatchu-server setup identity export > server-public.json
+```
+
+Generation refuses to replace an existing identity. Import `server-public.json` on the Client
+with `baradwatchu-agent trust import server-public.json`, after independently checking the
+fingerprint. Export the Client identity (`baradwatchu-agent identity export`) and register it
+in the Server dashboard with its verified fingerprint, name and IP:port. The local equivalent is:
+
+```sh
+./target/debug/baradwatchu-server setup client import client-public.json 192.0.2.10:7443 "Workstation" SHA256:VERIFIED_FINGERPRINT
+```
+
+The Client needs its existing system service listener configured, `remote enable`, and a linked
+user session/tray. Configure firewall/routing manually. Use the updated Client service **and**
+user agent: earlier strict v1 readers reject the optional requester metadata. No automatic
+fallback drops attribution. Select **Request audit** in the Server dashboard; the Client asks
+for consent naming the Google operator and the Server. Only local acceptance within **120
+seconds** starts execution. BUSY has no queue; UNAVAILABLE, REJECTED, EXPIRED and FAILED are
+shown explicitly. After a connection error, **Retry same request** retains the request ID;
+never automatically create a second request. Status polling stops on errors and can be resumed.
+
+The completed report is displayed/downloadable as JSON. It records `LOCAL`/`REMOTE` and, for
+remote audits, operator display name and Server reference. The Client's own history and PDF
+contain the same attribution. The trusted Server key authenticates the request; the name
+never does. Older reports remain readable with unknown origin. Google email/sub are not sent
+to the Client. The one-hour result lifetime is separate from the 120-second consent timeout;
+Client service restart loses in-memory results, Server restart loses routing records/sessions,
+and neither erases Client history. The dashboard retains the last request ID in tab storage,
+scoped to the operator, for refresh while the Server process survives.
 
 ## Linux source installation
 
-Supported installer detection: Arch Linux, Fedora, Debian and Ubuntu, including `ID_LIKE`. `--missing-deps` only inspects dependencies, reports missing local Angular packages and prints package-manager/project commands; it never installs system packages. Required source-build tools are Rust/Cargo 1.80+, Node.js 20 >=20.11.1, npm 8+, C/C++, make, Python 3 and tar; glibc 2.17+ is the minimum checked on the build host. A validated prebuilt cache does not require Node/Angular tooling, but this source installer builds those assets when building from source.
+Supported installer detection: Arch Linux, Fedora, Debian and Ubuntu, including `ID_LIKE`. `--missing-deps` only inspects dependencies, reports missing local Angular packages and prints package-manager/project commands; it never installs system packages. Required source-build tools are Rust/Cargo 1.88+, Node.js 20 >=20.11.1, npm 8+, C/C++, make, Python 3 and tar; glibc 2.17+ is the minimum checked on the build host. A validated prebuilt cache does not require Node/Angular tooling, but this source installer builds those assets when building from source.
 
 ```sh
 ./install.sh --help
@@ -88,11 +250,39 @@ sudo ./install.sh --no-build --build-dir="$HOME/.cache/baradwatchu/baradwatchu-s
 
 Source installation builds from this checkout. Arch `pacman`, Debian/Ubuntu `.deb`, and Fedora `.rpm` are planned in [`packaging/README.md`](packaging/README.md); none has a package recipe/artifact yet. The source installer refuses to mix with package-manager ownership.
 
-`cargo test --workspace --locked` runs 8 Rust tests; `npm test` runs 4 version tooling cases. No Angular UI test runner is configured. Formatting, Clippy and Rust/Angular builds are verified. Socket tests are blocked by the sandbox (`EPERM`); `npm start` is configured, but HTTP listening needs verification on the operator host. The Server enables Tokio I/O drivers, reports startup errors without panics, and implements graceful SIGINT/SIGTERM shutdown; the in-process `/health` router test passes, while live HTTP and connection draining remain unverified. Build cache v2 checks artifact hashes and glibc before reuse, without executing binaries in `--no-build`. Older caches require a rebuild; installed configuration and data are preserved.
+## Verification and limits
 
-## Security principles
+```sh
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+# Build Client in its own repository first; opt-in isolated cross-repository test:
+BWU_CLIENT_BIN=/absolute/path/to/BaradWatchU-Client/target/debug/baradwatchu-agent \
+  cargo test --lib two_oidc_admins --locked -- --ignored --nocapture
+(cd web && npm test && npm run build)
+# Requires Chrome and Node 20 experimental WebSocket:
+(cd web && node --experimental-websocket dashboard.smoke.mjs)
+```
 
-The project follows least privilege, audit-first behavior, minimal evidence collection, explicit policy authorization, and no arbitrary remote shell. The health endpoint exposes no sensitive data. Authentication, TLS, retention controls and tamper-evident audit storage are future work and must be in place before operational deployment.
+Automated verification covers the signed RSA OIDC mock/code/PKCE exchange, invalid claims,
+replay, allowlist/CSRF/session checks, manual trust and HTTP framing. The opt-in test exercises
+two independently allowlisted mock-Google operators through the real Server router/mTLS and
+real isolated Client service/link/audit processes; local consent is supplied through the Client
+CLI. Both names are checked in consent, returned JSON, cached history and PDF. It does not
+use Google credentials, a privileged installed service or a human-operated consent window.
+Browser smoke covers the built dashboard against a fixture API, including Secure/HttpOnly
+cookies on HTTP localhost. The bundled RSA key is test-only, never an operational credential.
+
+**Not verified:** live Google login with real OAuth credentials, two real Workspace users,
+production TLS proxy and real privileged service deployment. Follow the setup above, allow
+both real subjects, pair a real Client, request/accept one audit per operator and check both
+names in the consent prompt and result. No successful real-Google end-to-end run is claimed.
+Server MSRV is now 1.88 because the OIDC dependencies require it; validation used the local
+newer toolchain. Full source reinstall/service deployment was not performed for this MVP.
+
+Build cache v2 still checks artifact hashes/glibc before reuse, without executing binaries in
+`--no-build`. Old caches need rebuilding. User data/configuration are preserved. Audit findings
+are observations from the trusted Client, not independent Server certification or remediation.
 
 ## Requirements and roadmap
 

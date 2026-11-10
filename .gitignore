@@ -3,3 +3,13 @@
 /web/dist/
 /web/.angular/
 /web/out-tsc/
+
+# Local OAuth configuration and Server state (never commit secrets).
+/server.local.json
+/.env
+/.env.local
+/server-data/
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm

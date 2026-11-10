@@ -58,7 +58,19 @@ async fn run_server(config: Config) -> io::Result<()> {
         }
         println!("BaradWatchU Server shutting down");
     };
-    axum::serve(listener, router())
+    let routes = if let Some(settings) = config.settings {
+        let store = baradwatchu_server::storage::Store::open(
+            &baradwatchu_server::config::data_dir().map_err(io::Error::other)?,
+        )
+        .map_err(io::Error::other)?;
+        baradwatchu_server::http::application(
+            baradwatchu_server::http::App::new(store, settings).map_err(io::Error::other)?,
+        )
+    } else {
+        eprintln!("Server MVP is disabled: set BARADWATCHU_SERVER_CONFIG (health only)");
+        router()
+    };
+    axum::serve(listener, routes)
         .with_graceful_shutdown(shutdown)
         .await
 }
@@ -66,6 +78,19 @@ async fn run_server(config: Config) -> io::Result<()> {
 /// Return whether normal startup was requested; informational flags start no runtime.
 fn handle_cli() -> Result<bool, String> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.first().is_some_and(|s| s == "setup") {
+        let values: Vec<String> = args
+            .iter()
+            .skip(1)
+            .map(|s| {
+                s.to_str()
+                    .map(str::to_owned)
+                    .ok_or("invalid setup argument")
+            })
+            .collect::<Result<_, _>>()?;
+        provision(&values)?;
+        return Ok(false);
+    }
     match args.as_slice() {
         [] => Ok(true),
         [flag] if flag == "--version" || flag == "-V" => {
@@ -74,13 +99,35 @@ fn handle_cli() -> Result<bool, String> {
         }
         [flag] if flag == "--help" || flag == "-h" => {
             println!(
-                "BaradWatchU Server {}\n\nUsage: baradwatchu-server [OPTIONS]\n\nOptions:\n  -h, --help       Show this help and exit\n  -V, --version    Show product version and exit\n\nThe development server listens at 127.0.0.1:3000 by default. Set\nBARADWATCHU_SERVER_ADDR to an IP address and port (IPv6: [::1]:3000).\nCtrl-C or SIGTERM drains HTTP connections before shutdown on Linux.\nThe Angular dashboard is built and launched separately.",
+                "BaradWatchU Server {}\n\nUsage: baradwatchu-server [OPTIONS]\n\nOptions:\n  -h, --help       Show this help and exit\n  -V, --version    Show product version and exit\n\nThe development server listens at 127.0.0.1:3000 by default. Set\nBARADWATCHU_SERVER_ADDR to an IP address and port (IPv6: [::1]:3000).\nCtrl-C or SIGTERM drains HTTP connections before shutdown on Linux.\nConfigure the dashboard/OIDC with BARADWATCHU_SERVER_CONFIG (local JSON file).\nPersistent state: BARADWATCHU_SERVER_DATA_DIR (owner-only directory).\n\nLocal provisioning:\n  setup identity generate NAME\n  setup identity export\n  setup admin allow GOOGLE_SUB\n  setup admin revoke GOOGLE_SUB\n  setup client import FILE IP:PORT NAME SHA256:FINGERPRINT",
                 env!("CARGO_PKG_VERSION")
             );
             Ok(false)
         }
         _ => Err("invalid arguments; use --help for usage".to_owned()),
     }
+}
+
+fn provision(args: &[String]) -> Result<(), String> {
+    use baradwatchu_server::{
+        config::data_dir,
+        storage::{PublicIdentity, Store},
+    };
+    // Local filesystem ownership is the provisioning boundary, including the first admin.
+    let store = Store::open(&data_dir()?)?;
+    let output=match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+        ["identity","generate",name] => serde_json::to_value(store.generate(name)?).unwrap(),
+        ["identity","export"] => serde_json::to_value(store.identity()?.ok_or("identity not generated")?).unwrap(),
+        ["admin","allow",sub] => {store.allow(sub)?;serde_json::json!({"allowed":sub})},
+        ["admin","revoke",sub] => {store.revoke(sub)?;serde_json::json!({"revoked":sub})},
+        ["client","import",file,endpoint,name,fingerprint] => {
+            let identity:PublicIdentity=serde_json::from_slice(&std::fs::read(file).map_err(|_|"cannot read Client identity")?).map_err(|_|"invalid Client identity JSON")?;
+            serde_json::to_value(store.import(identity,name,endpoint,fingerprint)?).unwrap()
+        },
+        _ => return Err("Usage: setup identity generate NAME | setup identity export | setup admin allow SUB | setup admin revoke SUB | setup client import FILE IP:PORT NAME FINGERPRINT".into()),
+    };
+    println!("{}", serde_json::to_string_pretty(&output).unwrap());
+    Ok(())
 }
 
 #[cfg(test)]
