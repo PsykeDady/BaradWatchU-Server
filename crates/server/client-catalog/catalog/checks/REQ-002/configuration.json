@@ -1,0 +1,29 @@
+{
+  "schemaVersion": "baradwatchu.custom-checks.v1",
+  "id": "REQ-002",
+  "name": "Protezione antivirus",
+  "description": "Verifica che un antivirus supportato (ClamAV o Bitdefender GravityZone) sia attivo con firme aggiornate; acceptedProviders rende obbligatori i provider elencati.",
+  "priority": "HIGHEST",
+  "enabled": true,
+  "arguments": [],
+  "version": 2,
+  "parameters": {
+    "acceptedProviders": []
+  },
+  "providers": {
+    "clamav": {
+      "name": "ClamAV (clamd)",
+      "toolPath": "./providers/clamav.sh",
+      "parameters": {}
+    },
+    "bitdefender-gravityzone": {
+      "name": "Bitdefender GravityZone",
+      "toolPath": "./providers/bitdefender-gravityzone.sh",
+      "parameters": {
+        "maxSignatureAgeDays": 3,
+        "expectedCompanyId": ""
+      }
+    }
+  },
+  "overrideBuiltinId": null
+}

@@ -169,7 +169,8 @@ CREATE TABLE IF NOT EXISTS administrators (issuer TEXT NOT NULL, sub TEXT NOT NU
 CREATE TABLE IF NOT EXISTS received_reports (operator TEXT NOT NULL, request_id TEXT NOT NULL, client_id TEXT NOT NULL, client_name TEXT NOT NULL, fingerprint TEXT NOT NULL, completed INTEGER NOT NULL, report TEXT NOT NULL, PRIMARY KEY(operator,request_id));
 CREATE TABLE IF NOT EXISTS expected_manifest (singleton INTEGER PRIMARY KEY CHECK(singleton=1), content TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS requirement_definitions (id TEXT PRIMARY KEY, configuration TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS requirement_baselines (id TEXT PRIMARY KEY, name TEXT NOT NULL, expected_sha256 TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1);").map_err(|e|e.to_string())?;
+CREATE TABLE IF NOT EXISTS requirement_baselines (id TEXT PRIMARY KEY, name TEXT NOT NULL, expected_sha256 TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1);
+CREATE TABLE IF NOT EXISTS server_custom_checks (id TEXT PRIMARY KEY, package TEXT NOT NULL);").map_err(|e|e.to_string())?;
         Ok(Self(Mutex::new(c)))
     }
     #[cfg(test)]
@@ -260,6 +261,53 @@ CREATE TABLE IF NOT EXISTS requirement_baselines (id TEXT PRIMARY KEY, name TEXT
             .unwrap()
             .execute("DELETE FROM requirement_definitions WHERE id=?1", [id])
             .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    pub fn server_custom_checks(&self) -> Result<Vec<crate::custom_checks::CustomCheck>> {
+        let c = self.0.lock().unwrap();
+        let mut q = c
+            .prepare("SELECT package FROM server_custom_checks ORDER BY id")
+            .map_err(|e| e.to_string())?;
+        let rows = q
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        rows.map(|row| {
+            serde_json::from_str(&row.map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+        })
+        .collect()
+    }
+    pub fn server_custom_check(&self, id: &str) -> Result<crate::custom_checks::CustomCheck> {
+        let text = self
+            .0
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT package FROM server_custom_checks WHERE id=?1",
+                [id],
+                |r| r.get::<_, String>(0),
+            )
+            .map_err(|e| e.to_string())?;
+        serde_json::from_str(&text).map_err(|e| e.to_string())
+    }
+    pub fn save_server_custom_check(&self, item: &crate::custom_checks::CustomCheck) -> Result<()> {
+        item.validate()?;
+        let text = serde_json::to_string(item).map_err(|e| e.to_string())?;
+        self.0.lock().unwrap().execute(
+            "INSERT INTO server_custom_checks(id,package) VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET package=excluded.package",
+            params![item.id, text],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    pub fn remove_server_custom_check(&self, id: &str) -> Result<()> {
+        let changed = self
+            .0
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM server_custom_checks WHERE id=?1", [id])
+            .map_err(|e| e.to_string())?;
+        if changed == 0 {
+            return Err("custom check not found".into());
+        }
         Ok(())
     }
     pub fn requirement_baselines(&self) -> Result<Vec<RequirementBaseline>> {

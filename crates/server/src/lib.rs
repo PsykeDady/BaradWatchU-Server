@@ -1,6 +1,8 @@
 //! Server MVP: Google-authenticated fleet operations and consent-based Client audits.
 
+pub mod client_catalog;
 pub mod config;
+pub mod custom_checks;
 pub mod http;
 pub mod storage;
 

@@ -165,6 +165,21 @@ pub fn application(app: Arc<App>) -> Router {
             "/api/requirement-definitions/{id}",
             axum::routing::delete(remove_requirement_definition),
         )
+        .route(
+            "/api/custom-checks",
+            get(server_custom_checks)
+                .post(save_server_custom_check)
+                .layer(DefaultBodyLimit::max(2 * 1024 * 1024)),
+        )
+        .route(
+            "/api/custom-checks/{id}/export",
+            get(export_server_custom_check),
+        )
+        .route(
+            "/api/custom-checks/{id}",
+            axum::routing::delete(remove_server_custom_check),
+        )
+        .route("/api/client-catalog/file", get(client_catalog_file))
         .route("/api/messages", get(messages))
         .route(
             "/api/configuration/language",
@@ -1473,18 +1488,71 @@ async fn remove_requirement_definition(
     Ok(Json(json!({"ok":true})).into_response())
 }
 
+async fn server_custom_checks(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult {
+    admin(&app, &headers)?;
+    let views = app
+        .store
+        .server_custom_checks()
+        .map_err(unavailable)?
+        .iter()
+        .map(crate::custom_checks::CustomCheck::public_view)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(unavailable)?;
+    Ok(Json(views).into_response())
+}
+async fn save_server_custom_check(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Json(body): Json<crate::custom_checks::CustomCheck>,
+) -> ApiResult {
+    mutation(&app, &headers)?;
+    app.store.save_server_custom_check(&body).map_err(bad)?;
+    Ok(Json(body.public_view().map_err(bad)?).into_response())
+}
+async fn export_server_custom_check(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> ApiResult {
+    admin(&app, &headers)?;
+    let item = app.store.server_custom_check(&id).map_err(unavailable)?;
+    item.validate().map_err(unavailable)?;
+    Ok(Json(item).into_response())
+}
+async fn remove_server_custom_check(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> ApiResult {
+    mutation(&app, &headers)?;
+    app.store
+        .remove_server_custom_check(&id)
+        .map_err(unavailable)?;
+    Ok(Json(json!({"ok":true})).into_response())
+}
+#[derive(Deserialize)]
+struct CatalogFileQuery {
+    path: String,
+}
+async fn client_catalog_file(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Query(query): Query<CatalogFileQuery>,
+) -> ApiResult {
+    admin(&app, &headers)?;
+    let bytes = crate::client_catalog::file(&query.path)
+        .ok_or_else(|| bad("Client catalog file not found"))?;
+    Ok(Json(json!({"path":query.path,"source":String::from_utf8_lossy(bytes)})).into_response())
+}
+
 async fn expected_manifest(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult {
     admin(&app, &headers)?;
-    Ok(Json(
-        crate::manifest::view(
-            app.store
-                .expected_manifest()
-                .map_err(unavailable)?
-                .as_deref(),
-        )
-        .map_err(unavailable)?,
-    )
-    .into_response())
+    let configured = app.store.expected_manifest().map_err(unavailable)?;
+    let (text, source) = configured
+        .as_deref()
+        .map(|text| (text, "configured"))
+        .unwrap_or((crate::manifest::default_text(), "bundled"));
+    Ok(Json(crate::manifest::view(text, source).map_err(unavailable)?).into_response())
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1498,12 +1566,15 @@ async fn save_expected_manifest(
 ) -> ApiResult {
     mutation(&app, &headers)?;
     app.store.save_expected_manifest(&body.text).map_err(bad)?;
-    Ok(Json(crate::manifest::view(Some(&body.text)).map_err(bad)?).into_response())
+    Ok(Json(crate::manifest::view(&body.text, "configured").map_err(bad)?).into_response())
 }
 async fn remove_expected_manifest(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult {
     mutation(&app, &headers)?;
     app.store.remove_expected_manifest().map_err(unavailable)?;
-    Ok(Json(json!({"ok":true})).into_response())
+    Ok(Json(
+        crate::manifest::view(crate::manifest::default_text(), "bundled").map_err(unavailable)?,
+    )
+    .into_response())
 }
 
 fn comparison(app: &App, report: &crate::report::AuditReport) -> Result<Value, ApiError> {
@@ -1511,9 +1582,12 @@ fn comparison(app: &App, report: &crate::report::AuditReport) -> Result<Value, A
         report,
         &app.store.requirement_baselines().map_err(unavailable)?,
     );
-    if let Some(manifest) = app.store.expected_manifest().map_err(unavailable)? {
-        result["manifest"] = crate::manifest::compare(&manifest, report).map_err(unavailable)?;
-    }
+    let manifest = app
+        .store
+        .expected_manifest()
+        .map_err(unavailable)?
+        .unwrap_or_else(|| crate::manifest::default_text().to_owned());
+    result["manifest"] = crate::manifest::compare(&manifest, report).map_err(unavailable)?;
     result["definitions"] = json!(app
         .store
         .requirement_definitions()

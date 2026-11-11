@@ -252,13 +252,10 @@ e nessuno dei due cancella la cronologia Client. La dashboard mantiene l'ultimo 
 memoria della scheda, associato all'operatore, per refresh finché il processo Server resta attivo.
 
 La dashboard riprende la palette Ash & Ember del Client e consente di scegliere italiano o
-inglese (preferenza condivisa con il Client tramite language.json). Gli amministratori possono definire baseline SHA-256
-Server associate all'ID di un requisito. Per ogni audit completato il Server confronta questi
-valori con `provenance.actualSha256` e `integrityStatus` del risultato corrispondente riportato
-dal Client fidato; il confronto è restituito insieme al report Client, senza conservarne una
-seconda copia sul Server. Gli hash nel report remoto sono osservazioni autenticate dalla
-connessione mTLS esistente, non una firma separata del report. Configurare i digest sulla base
-del catalogo/pacchetto Client autorevole; una baseline non carica né modifica controlli Client.
+inglese (preferenza condivisa con il Client tramite language.json). La scheda Requisiti elenca
+il catalogo Client abbinato, con descrizioni localizzate, priorità, differenze per piattaforma,
+percorsi e SHA-256. Aprendo una voce si può leggere il sorgente Client incluso. Il Server non
+esegue questi file e non mostra risultati di esecuzione in questo catalogo.
 
 Il risultato permette anche di aprire un PDF stampabile con il renderer Client (template
 1.3.0), conservando versione Client, osservazioni e richiedente originali. La stampa usa il
@@ -281,17 +278,31 @@ Prima di modificare i file durante installazione, aggiornamento o rimozione, l'i
 
 Il selettore lingua nelle Impostazioni salva `system`, `italian` o `english` nel file compatibile con il Client `baradwatchu/language.json`, nella directory di configurazione dell’account Server. Le etichette della dashboard provengono dai cataloghi JSON tramite `/api/messages`; la stampa PDF legge la stessa preferenza. La modifica richiede una sessione autorizzata e la protezione CSRF. È condivisa con il Client eseguito dallo stesso account, non è una preferenza OIDC per browser.
 
-### Definizioni dei requisiti Client
+### Catalogo Client, aspettative Server e controlli personalizzati
 
-Le Impostazioni accettano lo schema `configuration.json` del Client (`baradwatchu.custom-checks.v1`): abilitazione, priorità, descrizione, parametri, argomenti, percorso del tool oppure provider, timeout, SHA-256 atteso, versione e override di sola configurazione. Incollare/modificare il JSON, salvarlo, esportarlo o rimuoverlo. Le definizioni sono persistite nel database SQLite del Server; solo operatori autorizzati possono modificarle, con protezione CSRF. Il Server non esegue questi tool né distribuisce configurazioni ai Client.
+Il binario Server include `catalog/builtin-tools.sha256`, configurazioni e sorgenti dei tool
+Client abbinati per Linux e Windows. È il catalogo atteso predefinito e compare nella scheda
+Requisiti con la versione Client abbinata. Il digest completo è mostrato nella dashboard;
+quello del manifest incluso è `4d4ddfb5a3b3db91adef6061acaaa0f9d8b83583c5cc4be3eb4198fef4dc3aeb`.
+Gli amministratori possono sostituire il manifest con quello di un pacchetto Client più
+recente e verificato; la modifica per tutta la flotta viene salvata in SQLite e non richiede
+la reinstallazione del Server. Il ripristino riattiva il manifest incluso nel Server
+installato. Un aggiornamento Server senza override adotta il nuovo catalogo incluso.
 
-Al recupero, i report vengono confrontati con abilitazione, priorità, identità del tool sostitutivo quando presente e hash atteso dell’entrypoint. Le evidenze mancanti sono `UNKNOWN`; il contratto report corrente non riporta i parametri, che quindi non possono essere verificati. La corrispondenza dell’entrypoint non verifica l’intera cartella del controllo. Le baseline SHA esplicite esistenti restano aspettative aggiuntive configurate indipendentemente. L’importazione di una definizione non importa fiducia né crea un’identità Server. Il confronto indipendente per file è descritto sotto.
+La scheda Requisiti permette anche di creare controlli personalizzati usando i campi del
+Client: ID, nome, descrizione, priorità, file tool, argomenti e timeout. Il Server conserva
+tool e metadati ma non li esegue. L’esportazione crea un pacchetto JSON portabile. Nel Client,
+in Controlli personalizzati, selezionare **Importa pacchetto Server**, verificare i campi
+precompilati e confermare; il Client calcola e registra lo SHA-256 del tool all’importazione.
+Il Client lo esegue solo dopo il normale flusso locale di importazione e una successiva azione
+di audit/controllo.
 
-### Manifest dei file atteso indipendentemente
-
-Nelle Impostazioni, incollare il testo esatto di `catalog/builtin-tools.sha256` da una versione del Client verificata indipendentemente. Viene salvato in SQLite solo dopo un’azione autorizzata esplicita; il Server non apprende automaticamente gli hash attesi dai report. Il formato è quello del Client: `REQ-ID piattaforma percorso-relativo SHA256`. Un solo manifest attivo si applica alla flotta; versioni diverse del Client possono legittimamente differire. Conservare i caratteri di fine riga originali per confrontare l’hash dell’intero manifest.
-
-I risultati confrontano l’hash osservato di ogni file e quello atteso dichiarato dal Client con le aspettative importate. Sono distinti file mancanti, aggiuntivi, duplicati e non verificati. Evidenze di installazione mancanti o piattaforma assente sono sconosciute. La corrispondenza completa richiede l’hash esatto del manifest e tutti i file attesi con identità, stato e hash dichiarati coerenti, senza file aggiuntivi. Resta un confronto di osservazioni autenticate via mTLS, non una prova di esecuzione dei controlli o una firma del report. Rimuovere il manifest elimina solo le aspettative Server; non cambia alcun Client.
+Per un audit ricevuto, il Server confronta ogni digest riportato per i file installati e
+l’hash atteso dichiarato dal Client con il manifest atteso attivo. Distingue file mancanti,
+aggiuntivi, duplicati e non verificati. Evidenza di installazione mancante o piattaforma
+assente è sconosciuta. Una corrispondenza completa richiede il digest esatto del manifest e
+tutti i file attesi con identità, stato e digest coerenti, senza file aggiuntivi. Sono
+osservazioni autenticate via mTLS: non provano l’esecuzione dei controlli e non firmano il report.
 
 I test estesi con Client reale verificano anche la cronologia Server dopo l’arresto del Client, isolamento/revoca degli operatori, cancellazione e uguaglianza byte per byte dei PDF con il Client usando lo stesso tema predefinito e lingua inglese. Eseguire con preferenze Server isolate:
 

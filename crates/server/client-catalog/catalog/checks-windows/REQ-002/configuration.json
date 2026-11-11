@@ -1,0 +1,37 @@
+{
+  "schemaVersion": "baradwatchu.custom-checks.v1",
+  "id": "REQ-002",
+  "name": "Protezione antivirus",
+  "description": "Verifica che un antivirus supportato (Microsoft Defender, Bitdefender GravityZone o un antivirus registrato nel Centro sicurezza Windows) sia attivo con firme aggiornate; acceptedProviders rende obbligatori i provider elencati.",
+  "priority": "HIGHEST",
+  "enabled": true,
+  "arguments": [],
+  "version": 2,
+  "timeoutSeconds": 60,
+  "parameters": {
+    "acceptedProviders": []
+  },
+  "providers": {
+    "defender": {
+      "name": "Microsoft Defender",
+      "toolPath": "./providers/defender.ps1",
+      "parameters": {
+        "maxSignatureAgeDays": 7
+      }
+    },
+    "bitdefender-gravityzone": {
+      "name": "Bitdefender GravityZone",
+      "toolPath": "./providers/bitdefender-gravityzone.ps1",
+      "parameters": {
+        "maxSignatureAgeDays": 3,
+        "expectedCompanyId": ""
+      }
+    },
+    "security-center": {
+      "name": "Centro sicurezza Windows (qualsiasi antivirus registrato)",
+      "toolPath": "./providers/security-center.ps1",
+      "parameters": {}
+    }
+  },
+  "overrideBuiltinId": null
+}

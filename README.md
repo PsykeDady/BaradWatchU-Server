@@ -253,13 +253,10 @@ and neither erases Client history. The dashboard retains the last request ID in 
 scoped to the operator, for refresh while the Server process survives.
 
 The dashboard follows the Client's Ash & Ember palette and offers Italian/English selection
-(shared with the Client through language.json). Administrators can define Server SHA-256 baselines by requirement ID.
-For each completed audit, the Server compares those values with the matching result's
-`provenance.actualSha256` and `integrityStatus` reported by the trusted Client; the comparison
-is returned alongside the Client report and is not stored as a second audit copy. Hashes in a
-remote report are observations authenticated by the existing mTLS Client connection, not a
-separate signature over the report. Configure only digests obtained from the authoritative
-Client check catalog/package; a baseline does not upload or change checks on a Client.
+(shared with the Client through language.json). Its Requirements tab lists the paired Client
+catalog, with localized descriptions, priority, platform-specific behavior, paths and SHA-256
+values. Expand an item to read its bundled Client tool/configuration source. The Server does
+not execute these files or show Client execution results in this catalog.
 
 The result view also opens a printable PDF using the Client renderer (template 1.3.0),
 including original Client version, observations and requester attribution. It renders the
@@ -276,17 +273,30 @@ of file hashes alone. Independently configured expectations remain separate from
 
 The Settings language selector persists `system`, `italian` or `english` in the Client-compatible `baradwatchu/language.json` under the Server account configuration directory. Dashboard labels come from JSON message catalogs through `/api/messages`; PDF rendering reads the same preference. Changing it requires an authorized session and CSRF protection. It is shared with a Client running under the same account, not a per-browser OIDC preference.
 
-### Client requirement definitions
+### Client catalog, Server expectations and custom checks
 
-Settings accepts the Client `configuration.json` schema (`baradwatchu.custom-checks.v1`): enabled state, priority, description, parameters, arguments, tool path or providers, timeout, expected SHA-256, version and configuration-only overrides. Paste/edit the JSON, save, export or remove it. Definitions are persisted in the Server SQLite database; only authorized operators may change them, with CSRF protection. The Server neither executes these tools nor distributes configuration to Clients.
+The Server binary bundles the paired Client release's `catalog/builtin-tools.sha256`,
+configurations and tool sources for Linux and Windows. This is the default expected catalog
+and is shown on the Requirements page with the paired Client version. The bundled manifest
+digest is `4d4ddfb5a3b3db91adef6061acaaa0f9d8b83583c5cc4be3eb4198fef4dc3aeb`. Administrators can replace it
+with the exact manifest from a newer verified Client package; that fleet-wide override is
+stored in SQLite and takes effect without reinstalling the Server. Reset restores the
+manifest bundled with the installed Server. A Server upgrade without an override adopts the
+new bundled baseline.
 
-On retrieval, reports are compared against definition enabled state, priority, override tool identity when reported, and expected entrypoint hash. Missing evidence is `UNKNOWN`; parameters are not echoed by the current report contract and cannot be checked. Entry-point matching does not verify the whole check folder. Existing explicit SHA baselines remain additional independently configured expectations. Importing a definition never imports trust or creates a Server identity. Independent per-file comparison is described below.
+The Requirements page also creates Server custom checks using the Client fields: ID, name,
+description, priority, tool file, arguments and timeout. The Server stores the tool and
+metadata but never executes it. Export produces a portable JSON package. On a Client, choose
+**Import Server package** in Custom Checks, review the prefilled values and confirm; the
+Client calculates and pins the tool SHA-256 during import. A Client runs it only after the
+normal local user import flow and later audit/check action.
 
-### Independently expected file manifest
-
-In Settings, paste the exact `catalog/builtin-tools.sha256` text from an independently verified Client release. It is stored in SQLite only after an explicit authorized action; the Server never learns expected hashes automatically from a report. The format is the Client's `REQ-ID platform relative-path SHA256` format. One active manifest applies to the fleet; mixed Client releases may legitimately differ. Preserve the original newlines when comparing the complete manifest hash.
-
-Results compare each file's observed digest and the Client's declared expected digest with the imported expectations. Missing, extra, duplicate and unverified files are distinguished. Missing installation evidence or an absent platform is unknown. A complete match requires the exact manifest digest and every expected file with consistent reported identity/state/digests and no extra files. This remains comparison of mTLS-authenticated observations, not proof that checks ran or a report signature. Removing the manifest only removes Server expectations; it changes no Client.
+For a received audit, the Server compares every installed catalog file's reported digest and
+the Client-declared expected digest with the active expected manifest. Missing, extra,
+duplicate and unverified files are distinguished. Missing installation evidence or an
+absent platform is unknown. A complete match requires the exact manifest digest and every
+expected file with consistent reported identity/state/digests and no extra files. This
+compares mTLS-authenticated observations; it does not prove checks ran or sign the report.
 
 The extended real-Client tests also verify Server history after Client shutdown, operator isolation/revocation, deletion, and byte-for-byte PDF equality with the Client under the same default theme and English language. Run with isolated Server preferences:
 

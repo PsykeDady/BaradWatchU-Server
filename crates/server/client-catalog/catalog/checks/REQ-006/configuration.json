@@ -1,0 +1,14 @@
+{
+  "schemaVersion": "baradwatchu.custom-checks.v1",
+  "id": "REQ-006",
+  "name": "Cifratura dei dati",
+  "description": "Rileva i metodi di cifratura supportati: LUKS e eCryptfs.",
+  "priority": "HIGHEST",
+  "enabled": true,
+  "toolPath": "./check.sh",
+  "arguments": [],
+  "expectedSha256": "4b0b20970976b83a63902b692a3c3cd29a9bbe357871fd03a3779d5f08d0c2cc",
+  "version": 1,
+  "parameters": {},
+  "overrideBuiltinId": null
+}

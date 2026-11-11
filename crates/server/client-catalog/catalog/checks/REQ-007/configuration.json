@@ -1,0 +1,17 @@
+{
+  "schemaVersion": "baradwatchu.custom-checks.v1",
+  "id": "REQ-007",
+  "name": "Blocco schermo",
+  "description": "Verifica il blocco automatico della sessione.",
+  "priority": "LOW",
+  "enabled": true,
+  "toolPath": "./check.sh",
+  "arguments": [],
+  "expectedSha256": "b12f04056f6bc90bc8f1646406ec99e36ecc0d297711853e6f7969ee4b4c997d",
+  "version": 1,
+  "parameters": {
+    "maxTimeoutMinutes": 5,
+    "maxLockGraceSeconds": 0
+  },
+  "overrideBuiltinId": null
+}

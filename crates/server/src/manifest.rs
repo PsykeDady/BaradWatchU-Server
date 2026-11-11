@@ -1,8 +1,19 @@
-//! Independently provisioned Client builtin-tools.sha256; never trust report hashes as expectations.
+//! Client builtin-tools.sha256 shipped as the paired baseline, with an optional admin override.
 use crate::report::{AuditReport, FileState, IntegrityStatus};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+
+pub const BUNDLED_CLIENT_MANIFEST: &str =
+    include_str!("../client-catalog/catalog/builtin-tools.sha256");
+
+pub fn bundled_client_version() -> &'static str {
+    include_str!("../client-catalog/client-version.txt").trim()
+}
+
+pub fn default_text() -> &'static str {
+    BUNDLED_CLIENT_MANIFEST
+}
 
 #[derive(Debug)]
 pub struct Entry {
@@ -69,16 +80,17 @@ pub fn parse(text: &str) -> Result<Vec<Entry>, String> {
 pub fn digest(text: &str) -> String {
     format!("{:x}", Sha256::digest(text.as_bytes()))
 }
-pub fn view(text: Option<&str>) -> Result<Value, String> {
-    match text {
-        None => Ok(Value::Null),
-        Some(text) => {
-            let entries = parse(text)?;
-            Ok(
-                json!({"text":text,"sha256":digest(text),"files":entries.len(),"platforms":entries.iter().map(|e|e.platform.as_str()).collect::<BTreeSet<_>>()}),
-            )
-        }
-    }
+pub fn view(text: &str, source: &str) -> Result<Value, String> {
+    let entries = parse(text)?;
+    Ok(json!({
+        "text": text,
+        "sha256": digest(text),
+        "files": entries.len(),
+        "platforms": entries.iter().map(|e| e.platform.as_str()).collect::<BTreeSet<_>>(),
+        "source": source,
+        "clientVersion": (source == "bundled").then(bundled_client_version),
+        "entries": entries.iter().map(|e| json!({"requirementId":e.requirement,"platform":e.platform,"path":e.path,"sha256":e.sha256})).collect::<Vec<_>>()
+    }))
 }
 pub fn compare(text: &str, report: &AuditReport) -> Result<Value, String> {
     let entries = parse(text)?;
