@@ -2,7 +2,7 @@ use crate::{
     auth::{self, Auth, Session},
     config::Settings,
     remote,
-    storage::{self, PublicIdentity, Store, TrustedClient},
+    storage::{self, PublicIdentity, RequirementBaseline, Store, TrustedClient},
 };
 use axum::{
     extract::{DefaultBodyLimit, Path, Query, State},
@@ -79,10 +79,19 @@ pub fn application(app: Arc<App>) -> Router {
         .route("/api/identity", get(identity))
         .route("/api/identity/generate", post(generate))
         .route("/api/clients", get(clients).post(import_client))
+        .route("/api/requirements", get(requirements).post(save_requirement))
+        .route("/api/requirements/{id}", axum::routing::delete(remove_requirement))
         .route("/api/clients/{id}", axum::routing::delete(remove_client))
         .route("/api/clients/{id}/requests", post(create_request))
         .route("/api/requests/{id}", get(request_status))
         .route("/api/requests/{id}/result", get(request_result))
+        .route("/api/requests/{id}/pdf", get(request_pdf))
+        .route("/api/expected-manifest", get(expected_manifest).put(save_expected_manifest).delete(remove_expected_manifest))
+        .route("/api/requirement-definitions", get(requirement_definitions).post(save_requirement_definition))
+        .route("/api/requirement-definitions/{id}", axum::routing::delete(remove_requirement_definition))
+        .route("/api/messages", get(messages))
+        .route("/api/configuration/language", get(language).put(update_language))
+        .route("/api/report-theme", get(report_theme).put(update_report_theme))
         .with_state(app)
         .fallback_service(
             tower_http::services::ServeDir::new(web).append_index_html_on_directories(true),
@@ -310,6 +319,24 @@ async fn remove_client(
     app.store.remove_client(&id).map_err(unavailable)?;
     Ok(Json(json!({"ok":true})).into_response())
 }
+async fn requirements(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult {
+    admin(&app, &headers)?;
+    Ok(Json(app.store.requirement_baselines().map_err(unavailable)?).into_response())
+}
+#[derive(Deserialize)]
+#[serde(rename_all="camelCase", deny_unknown_fields)]
+struct RequirementInput { id:String, name:String, expected_sha256:String, enabled:bool }
+async fn save_requirement(State(app):State<Arc<App>>, headers:HeaderMap, Json(body):Json<RequirementInput>) -> ApiResult {
+    mutation(&app,&headers)?;
+    let item=RequirementBaseline{id:body.id,name:body.name,expected_sha256:body.expected_sha256,enabled:body.enabled};
+    app.store.save_requirement_baseline(&item).map_err(bad)?;
+    Ok(Json(item).into_response())
+}
+async fn remove_requirement(State(app):State<Arc<App>>, headers:HeaderMap, Path(id):Path<String>) -> ApiResult {
+    mutation(&app,&headers)?;
+    app.store.remove_requirement_baseline(&id).map_err(unavailable)?;
+    Ok(Json(json!({"ok":true})).into_response())
+}
 fn valid_id(id: &str) -> bool {
     (8..=64).contains(&id.len())
         && id
@@ -447,6 +474,28 @@ async fn request_result(
     )
     .await
 }
+async fn report_theme(State(app):State<Arc<App>>, headers:HeaderMap) -> ApiResult {
+    admin(&app,&headers)?;
+    let text=crate::pdf::dashboard_theme_json().map_err(|e|bad(e.0))?;
+    Ok(([(header::CONTENT_TYPE,"application/json")],text).into_response())
+}
+async fn update_report_theme(State(app):State<Arc<App>>, headers:HeaderMap, Json(body):Json<Value>) -> ApiResult {
+    mutation(&app,&headers)?;
+    let text=crate::pdf::dashboard_update_theme(&body.to_string()).map_err(|e|bad(e.0))?;
+    Ok(([(header::CONTENT_TYPE,"application/json")],text).into_response())
+}
+async fn request_pdf(State(app):State<Arc<App>>, headers:HeaderMap, Path(id):Path<String>) -> ApiResult {
+    let r=record(&app,&headers,&id)?;
+    let _permit=app.connections.try_acquire().map_err(|_|ApiError(StatusCode::SERVICE_UNAVAILABLE,"SERVER_BUSY".into()))?;
+    let reply=remote::request(app.store.signing_key().map_err(bad)?,r.client.clone(),"GET",format!("/v1/audit-requests/{id}/result"),None).await.map_err(unavailable)?;
+    validate_reply(&reply,&id,&r.client.id,true).map_err(unavailable)?;
+    if reply.code!=200 {
+        return Ok((StatusCode::from_u16(reply.code).map_err(|_|unavailable("invalid remote status"))?,Json(reply.body)).into_response());
+    }
+    let report=crate::report_integrity::parse(&reply.body["report"]).map_err(unavailable)?;
+    let bytes=tokio::task::spawn_blocking(move||crate::pdf::render_received(&report)).await.map_err(|_|unavailable("PDF_RENDER_FAILED"))?.map_err(bad)?;
+    Ok(([(header::CONTENT_TYPE,"application/pdf"),(header::CONTENT_DISPOSITION,"inline; filename=baradwatchu-client-audit.pdf")],bytes).into_response())
+}
 async fn forward(
     app: &App,
     r: &RequestRecord,
@@ -460,7 +509,7 @@ async fn forward(
         .connections
         .try_acquire()
         .map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "SERVER_BUSY".into()))?;
-    let reply = remote::request(
+    let mut reply = remote::request(
         app.store.signing_key().map_err(bad)?,
         r.client.clone(),
         method,
@@ -470,6 +519,15 @@ async fn forward(
     .await
     .map_err(unavailable)?;
     validate_reply(&reply, id, &r.client.id, result).map_err(unavailable)?;
+    if result && reply.code == 200 {
+        let baselines = app.store.requirement_baselines().map_err(unavailable)?;
+        let report = crate::report_integrity::parse(&reply.body["report"]).map_err(unavailable)?;
+        reply.body["serverRequirementComparison"] = crate::report_integrity::inspect(&report, &baselines);
+        if let Some(manifest)=app.store.expected_manifest().map_err(unavailable)? {
+            reply.body["serverRequirementComparison"]["manifest"]=crate::manifest::compare(&manifest,&report).map_err(unavailable)?;
+        }
+        reply.body["serverRequirementComparison"]["definitions"] = Json(app.store.requirement_definitions().map_err(unavailable)?.iter().map(|d|d.compare(&report)).collect::<Vec<_>>()).0.into();
+    }
     Ok((
         StatusCode::from_u16(reply.code).map_err(|_| unavailable("invalid remote HTTP status"))?,
         Json(reply.body),
@@ -532,6 +590,70 @@ mod tests {
             requester_metadata("Operatore locale", "Server di sviluppo"),
             json!({"operatorDisplayName":"Operatore locale","serverDisplayName":"Server di sviluppo"})
         );
+    }
+    #[tokio::test]
+    async fn manifest_api_requires_authorization_csrf_and_explicit_provisioning() {
+        for state in [app(),local_app()] {
+            let routes=application(state.clone());
+            for method in ["GET","DELETE"] {
+                let response=routes.clone().oneshot(Request::builder().method(method).uri("/api/expected-manifest").body(Body::empty()).unwrap()).await.unwrap();
+                assert_eq!(response.status(),StatusCode::UNAUTHORIZED);
+            }
+            assert!(state.store.expected_manifest().unwrap().is_none());
+        }
+        let state=local_app();let routes=application(state.clone());
+        let response=routes.clone().oneshot(Request::get("/api/session").body(Body::empty()).unwrap()).await.unwrap();
+        let cookie=response.headers()[header::SET_COOKIE].to_str().unwrap().split(';').next().unwrap().to_owned();
+        let session:Value=serde_json::from_slice(&to_bytes(response.into_body(),4096).await.unwrap()).unwrap();
+        let text=include_str!("../tests/fixtures/client-builtin-tools.sha256");
+        let body=json!({"text":text}).to_string();
+        let response=routes.clone().oneshot(Request::put("/api/expected-manifest").header(header::COOKIE,&cookie).header(header::CONTENT_TYPE,"application/json").body(Body::from(body.clone())).unwrap()).await.unwrap();
+        assert_eq!(response.status(),StatusCode::FORBIDDEN);
+        assert!(state.store.expected_manifest().unwrap().is_none());
+        let response=routes.oneshot(Request::put("/api/expected-manifest").header(header::COOKIE,cookie).header(header::ORIGIN,"http://localhost:3000").header("x-bwu-csrf",session["csrf"].as_str().unwrap()).header(header::CONTENT_TYPE,"application/json").body(Body::from(body)).unwrap()).await.unwrap();
+        assert_eq!(response.status(),StatusCode::OK);
+        assert_eq!(state.store.expected_manifest().unwrap().as_deref(),Some(text));
+    }
+    #[tokio::test]
+    async fn requirement_definition_routes_require_authorization_and_csrf() {
+        for state in [app(),local_app()] {
+            let routes=application(state);
+            let response=routes.clone().oneshot(Request::get("/api/requirement-definitions").body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(),StatusCode::UNAUTHORIZED);
+            let response=routes.clone().oneshot(Request::delete("/api/requirement-definitions/CUSTOM-001").body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(),StatusCode::UNAUTHORIZED);
+        }
+        let state=local_app();let routes=application(state.clone());
+        let response=routes.clone().oneshot(Request::get("/api/session").body(Body::empty()).unwrap()).await.unwrap();
+        let cookie=response.headers()[header::SET_COOKIE].to_str().unwrap().split(';').next().unwrap().to_owned();
+        let session:Value=serde_json::from_slice(&to_bytes(response.into_body(),4096).await.unwrap()).unwrap();
+        let body=r#"{"schemaVersion":"baradwatchu.custom-checks.v1","id":"CUSTOM-001","name":"Test","description":"","enabled":false,"priority":"HIGH","overrideBuiltinId":"REQ-001"}"#;
+        let response=routes.clone().oneshot(Request::post("/api/requirement-definitions").header(header::COOKIE,&cookie).header(header::CONTENT_TYPE,"application/json").body(Body::from(body)).unwrap()).await.unwrap();
+        assert_eq!(response.status(),StatusCode::FORBIDDEN);
+        assert!(state.store.requirement_definitions().unwrap().is_empty());
+        let response=routes.clone().oneshot(Request::post("/api/requirement-definitions").header(header::COOKIE,&cookie).header(header::ORIGIN,"http://localhost:3000").header("x-bwu-csrf",session["csrf"].as_str().unwrap()).header(header::CONTENT_TYPE,"application/json").body(Body::from(body)).unwrap()).await.unwrap();
+        assert_eq!(response.status(),StatusCode::OK);
+        assert_eq!(state.store.requirement_definitions().unwrap()[0].override_builtin_id.as_deref(),Some("REQ-001"));
+    }
+    #[tokio::test]
+    async fn language_settings_require_authorization_and_csrf() {
+        for state in [app(), local_app()] {
+            let routes=application(state);
+            let response=routes.clone().oneshot(Request::get("/api/configuration/language").body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(),StatusCode::UNAUTHORIZED);
+            let response=routes.clone().oneshot(Request::put("/api/configuration/language").header(header::CONTENT_TYPE,"application/json").body(Body::from(r#"{"language":"english"}"#)).unwrap()).await.unwrap();
+            assert_eq!(response.status(),StatusCode::UNAUTHORIZED);
+            let catalog=routes.oneshot(Request::get("/api/messages").body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(catalog.status(),StatusCode::OK);
+            let catalog:Value=serde_json::from_slice(&to_bytes(catalog.into_body(),65536).await.unwrap()).unwrap();
+            assert!(catalog["messages"]["server.settings"].is_string());
+            assert!(catalog.get("operator").is_none());
+        }
+        let routes=application(local_app());
+        let response=routes.clone().oneshot(Request::get("/api/session").body(Body::empty()).unwrap()).await.unwrap();
+        let cookie=response.headers()[header::SET_COOKIE].to_str().unwrap().split(';').next().unwrap().to_owned();
+        let response=routes.oneshot(Request::put("/api/configuration/language").header(header::COOKIE,cookie).header(header::CONTENT_TYPE,"application/json").body(Body::from(r#"{"language":"english"}"#)).unwrap()).await.unwrap();
+        assert_eq!(response.status(),StatusCode::FORBIDDEN);
     }
     #[tokio::test]
     async fn health_returns_the_bootstrap_contract() {
@@ -724,4 +846,51 @@ mod tests {
             serde_json::from_slice(&to_bytes(mode.into_body(), 1024).await.unwrap()).unwrap();
         assert_eq!(value["mode"], "OIDC");
     }
+}
+
+async fn language(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult {
+    admin(&app, &headers)?;
+    Ok(Json(crate::preferences::language_view()).into_response())
+}
+async fn update_language(State(app): State<Arc<App>>, headers: HeaderMap, Json(body): Json<crate::preferences::LanguageRequest>) -> ApiResult {
+    mutation(&app, &headers)?;
+    Ok(Json(crate::preferences::save_language(body).map_err(|e| bad(e.0))?).into_response())
+}
+
+// Presentation catalog only: usable on the OIDC login screen, no operator data.
+async fn messages() -> Json<Value> {
+    Json(crate::preferences::language_view())
+}
+
+async fn requirement_definitions(State(app):State<Arc<App>>,headers:HeaderMap)->ApiResult {
+    admin(&app,&headers)?;
+    Ok(Json(app.store.requirement_definitions().map_err(unavailable)?).into_response())
+}
+async fn save_requirement_definition(State(app):State<Arc<App>>,headers:HeaderMap,Json(body):Json<crate::requirement_config::CheckConfiguration>)->ApiResult {
+    mutation(&app,&headers)?;
+    app.store.save_requirement_definition(&body).map_err(bad)?;
+    Ok(Json(body).into_response())
+}
+async fn remove_requirement_definition(State(app):State<Arc<App>>,headers:HeaderMap,Path(id):Path<String>)->ApiResult {
+    mutation(&app,&headers)?;
+    app.store.remove_requirement_definition(&id).map_err(unavailable)?;
+    Ok(Json(json!({"ok":true})).into_response())
+}
+
+async fn expected_manifest(State(app):State<Arc<App>>,headers:HeaderMap)->ApiResult {
+    admin(&app,&headers)?;
+    Ok(Json(crate::manifest::view(app.store.expected_manifest().map_err(unavailable)?.as_deref()).map_err(unavailable)?).into_response())
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestInput {text:String}
+async fn save_expected_manifest(State(app):State<Arc<App>>,headers:HeaderMap,Json(body):Json<ManifestInput>)->ApiResult {
+    mutation(&app,&headers)?;
+    app.store.save_expected_manifest(&body.text).map_err(bad)?;
+    Ok(Json(crate::manifest::view(Some(&body.text)).map_err(bad)?).into_response())
+}
+async fn remove_expected_manifest(State(app):State<Arc<App>>,headers:HeaderMap)->ApiResult {
+    mutation(&app,&headers)?;
+    app.store.remove_expected_manifest().map_err(unavailable)?;
+    Ok(Json(json!({"ok":true})).into_response())
 }

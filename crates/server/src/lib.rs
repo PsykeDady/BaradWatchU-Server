@@ -15,3 +15,13 @@ mod oidc_tests;
 mod client_fixture;
 #[cfg(test)]
 mod e2e_tests;
+
+pub mod report;
+pub mod report_integrity;
+
+mod pdf;
+mod preferences;
+
+pub mod requirement_config;
+
+pub mod manifest;

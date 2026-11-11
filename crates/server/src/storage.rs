@@ -113,6 +113,14 @@ pub struct TrustedClient {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RequirementBaseline {
+    pub id: String,
+    pub name: String,
+    pub expected_sha256: String,
+    pub enabled: bool,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Operator {
     pub issuer: String,
     pub sub: String,
@@ -157,7 +165,10 @@ impl Store {
         c.execute_batch("PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS identity (singleton INTEGER PRIMARY KEY CHECK(singleton=1), seed BLOB NOT NULL, name TEXT NOT NULL, created INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS clients (id TEXT PRIMARY KEY, name TEXT NOT NULL, endpoint TEXT NOT NULL, public_key TEXT UNIQUE NOT NULL, fingerprint TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS administrators (issuer TEXT NOT NULL, sub TEXT NOT NULL, name TEXT NOT NULL DEFAULT '', email TEXT NOT NULL DEFAULT '', PRIMARY KEY(issuer,sub));").map_err(|e|e.to_string())?;
+CREATE TABLE IF NOT EXISTS administrators (issuer TEXT NOT NULL, sub TEXT NOT NULL, name TEXT NOT NULL DEFAULT '', email TEXT NOT NULL DEFAULT '', PRIMARY KEY(issuer,sub));
+CREATE TABLE IF NOT EXISTS expected_manifest (singleton INTEGER PRIMARY KEY CHECK(singleton=1), content TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS requirement_definitions (id TEXT PRIMARY KEY, configuration TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS requirement_baselines (id TEXT PRIMARY KEY, name TEXT NOT NULL, expected_sha256 TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1);").map_err(|e|e.to_string())?;
         Ok(Self(Mutex::new(c)))
     }
     #[cfg(test)]
@@ -193,6 +204,44 @@ CREATE TABLE IF NOT EXISTS administrators (issuer TEXT NOT NULL, sub TEXT NOT NU
             &seed.try_into().map_err(|_| "damaged identity")?,
         ))
     }
+    pub fn expected_manifest(&self)->Result<Option<String>> {
+        self.0.lock().unwrap().query_row("SELECT content FROM expected_manifest WHERE singleton=1",[],|r|r.get(0)).optional().map_err(|e|e.to_string())
+    }
+    pub fn save_expected_manifest(&self,text:&str)->Result<()> {
+        crate::manifest::parse(text)?;
+        self.0.lock().unwrap().execute("INSERT INTO expected_manifest(singleton,content) VALUES(1,?1) ON CONFLICT(singleton) DO UPDATE SET content=excluded.content",[text]).map_err(|e|e.to_string())?;Ok(())
+    }
+    pub fn remove_expected_manifest(&self)->Result<()> {
+        self.0.lock().unwrap().execute("DELETE FROM expected_manifest",[]).map_err(|e|e.to_string())?;Ok(())
+    }
+    pub fn requirement_definitions(&self) -> Result<Vec<crate::requirement_config::CheckConfiguration>> {
+        let c=self.0.lock().unwrap();
+        let mut q=c.prepare("SELECT configuration FROM requirement_definitions ORDER BY id").map_err(|e|e.to_string())?;
+        let rows=q.query_map([],|r|r.get::<_,String>(0)).map_err(|e|e.to_string())?;
+        rows.map(|row|serde_json::from_str(&row.map_err(|e|e.to_string())?).map_err(|e|e.to_string())).collect()
+    }
+    pub fn save_requirement_definition(&self, config:&crate::requirement_config::CheckConfiguration) -> Result<()> {
+        config.validate()?;
+        let text=serde_json::to_string(config).map_err(|e|e.to_string())?;
+        self.0.lock().unwrap().execute("INSERT INTO requirement_definitions(id,configuration) VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET configuration=excluded.configuration",params![config.id,text]).map_err(|e|e.to_string())?;
+        Ok(())
+    }
+    pub fn remove_requirement_definition(&self,id:&str)->Result<()> {
+        self.0.lock().unwrap().execute("DELETE FROM requirement_definitions WHERE id=?1",[id]).map_err(|e|e.to_string())?;
+        Ok(())
+    }
+    pub fn requirement_baselines(&self) -> Result<Vec<RequirementBaseline>> {
+        let c = self.0.lock().unwrap();
+        let mut q = c.prepare("SELECT id,name,expected_sha256,enabled FROM requirement_baselines ORDER BY id").map_err(|e|e.to_string())?;
+        let rows=q.query_map([], |r| Ok(RequirementBaseline { id:r.get(0)?, name:r.get(1)?, expected_sha256:r.get(2)?, enabled:r.get::<_,i64>(3)? != 0 })).map_err(|e|e.to_string())?;
+        rows.collect::<std::result::Result<Vec<_>,_>>().map_err(|e|e.to_string())
+    }
+    pub fn save_requirement_baseline(&self, item: &RequirementBaseline) -> Result<()> {
+        if item.id.is_empty() || item.id.len() > 128 || !item.id.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) || item.name.trim().is_empty() || item.name.chars().count() > 256 || item.expected_sha256.len() != 64 || !item.expected_sha256.bytes().all(|b| b.is_ascii_hexdigit()) { return Err("invalid requirement baseline; expected ID, name and SHA-256 hex digest".into()); }
+        self.0.lock().unwrap().execute("INSERT INTO requirement_baselines(id,name,expected_sha256,enabled) VALUES(?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET name=excluded.name,expected_sha256=excluded.expected_sha256,enabled=excluded.enabled", params![item.id,item.name,item.expected_sha256.to_ascii_lowercase(),item.enabled as i64]).map_err(|e|e.to_string())?;
+        Ok(())
+    }
+    pub fn remove_requirement_baseline(&self, id: &str) -> Result<()> { self.0.lock().unwrap().execute("DELETE FROM requirement_baselines WHERE id=?1",[id]).map_err(|e|e.to_string())?; Ok(()) }
     pub fn identity(&self) -> Result<Option<PublicIdentity>> {
         let row: Option<(Vec<u8>, String, u64)> = self
             .0

@@ -1,16 +1,29 @@
 // Isolated browser/API fixture; does not authenticate against Google.
 // Run after npm run build: node --experimental-websocket dashboard.smoke.mjs
 import http from 'node:http';
+import {readFileSync} from 'node:fs';
 import {spawn} from 'node:child_process';
 import {mkdtemp,readFile,writeFile,rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join,resolve,extname} from 'node:path';
 import assert from 'node:assert/strict';
 const root=resolve('dist/server-dashboard/browser'), profile=await mkdtemp(join(tmpdir(),'bwu-browser-'));
-let cookieSeen=false,id='',polls=0;
+let cookieSeen=false,id='',polls=0,language='english',definitions=[];
 const server=http.createServer(async(req,res)=>{
  res.setHeader('Cache-Control','no-store');res.setHeader('Content-Security-Policy',"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'");
  const send=(data,code=200)=>{res.writeHead(code,{'Content-Type':'application/json'});res.end(JSON.stringify(data));};
+ if(req.url==='/api/messages'||req.url==='/api/configuration/language'){
+  if(req.method==='PUT'){assert.equal(req.headers['x-bwu-csrf'],'csrf');let b='';for await(const c of req)b+=c;language=JSON.parse(b).language;}
+  const locale=language==='italian'?'it_IT':'en_EN';
+  return send({language,effectiveLanguage:locale,messages:JSON.parse(readFileSync(new URL(`../crates/messages/locales/${locale}.json`,import.meta.url),'utf8')).messages});
+ }
+ if(req.url==='/api/expected-manifest')return send(null);
+ if(req.url==='/api/report-theme')return send({selectedThemeId:'default',themes:[{id:'default',name:'BaradWatchU'}]});
+ if(req.url==='/api/requirement-definitions'){
+  if(req.method==='POST'){assert.equal(req.headers['x-bwu-csrf'],'csrf');let b='';for await(const c of req)b+=c;const definition=JSON.parse(b);definitions=[definition];return send(definition);}
+  return send(definitions);
+ }
+ if(req.url==='/api/requirements')return send([]);
  if(req.url==='/api/auth-mode')return send({mode:'LOCAL'});
  if(req.url==='/api/session'){cookieSeen=req.headers.cookie?.includes('__Host-bwu-session=fixture');return send({mode:'LOCAL',operator:{id:'LOCAL',name:'Mario Rossi'},authorized:true,csrf:'csrf'});}
  if(req.url==='/api/identity')return send({id:'SRV-TEST',name:'Company Server',fingerprint:'SHA256:test'});
@@ -31,12 +44,28 @@ try{
  let seq=0;const pending=new Map(),errors=[];ws.addEventListener('message',({data})=>{const m=JSON.parse(data);if(m.id){pending.get(m.id)?.(m);pending.delete(m.id);}if(m.method==='Runtime.exceptionThrown')errors.push(m.params);});
  const call=(method,params={})=>new Promise((ok,no)=>{const id=++seq;pending.set(id,m=>m.error?no(m.error):ok(m.result));ws.send(JSON.stringify({id,method,params}));});
  const evaluate=async(expression)=>(await call('Runtime.evaluate',{expression,returnByValue:true})).result.value;
- const wait=async(expression)=>{const end=Date.now()+20000;while(Date.now()<end){if(await evaluate(expression))return;await new Promise(r=>setTimeout(r,100));}throw Error('Timed out: '+expression);};
+ const wait=async(expression)=>{const end=Date.now()+20000;while(Date.now()<end){if(await evaluate(expression))return;await new Promise(r=>setTimeout(r,100));}throw Error('Timed out: '+expression+'; body='+await evaluate('document.body.innerText'));};
  await call('Runtime.enable');await call('Page.enable');await call('Page.navigate',{url:`http://localhost:${server.address().port}/`});
- await wait("document.body.innerText.includes('Workstation')");assert.ok(cookieSeen,'Secure cookie sent on HTTP localhost');assert.equal(await evaluate('document.cookie.includes("bwu-session")'),false,'HttpOnly cookie hidden');assert.ok(await evaluate("document.body.innerText.includes('display name is descriptive, not an authenticated OS user')"));assert.equal(await evaluate("document.body.innerText.includes('Continue with Google')"),false,'LOCAL mode has no Google login');
- await evaluate("[...document.querySelectorAll('button')].find(b=>b.textContent==='Request audit').click()");
+ await wait("document.body.innerText.includes('Workstation')");assert.ok(cookieSeen,'Secure cookie sent on HTTP localhost');assert.equal(await evaluate('document.cookie.includes("bwu-session")'),false,'HttpOnly cookie hidden');assert.equal(await evaluate("document.body.innerText.includes('Continue with Google')"),false,'LOCAL mode has no Google login');
+ assert.equal(await evaluate("getComputedStyle(document.querySelector('.brand-mark')).fontSize"),'0px','Client logo hides the B text');
+ await evaluate("[...document.querySelectorAll('button')].find(b=>b.textContent.trim()==='Settings').click()");
+ await wait("document.body.innerText.includes('Server identity')");
+ assert.ok(await evaluate("document.body.innerText.includes('loopback access does not authenticate')"));
+ await evaluate("(()=>{const s=[...document.querySelectorAll('select')].find(s=>[...s.options].some(o=>o.value==='italian'));s.value='italian';s.dispatchEvent(new Event('change'));})()");
+ await wait("document.documentElement.lang==='it' && document.body.innerText.includes('Identità Server')");
+ assert.equal(language,'italian','language saved through shared API');
+ await evaluate("(()=>{const input=[...document.querySelectorAll('textarea')].find(t=>t.value.includes('baradwatchu.custom-checks.v1'));const config=JSON.parse(input.value);config.name='Fixture requirement';config.expectedSha256='a'.repeat(64);input.value=JSON.stringify(config);input.dispatchEvent(new Event('input'));[...document.querySelectorAll('button')].find(b=>b.textContent.trim()==='Salva definizione').click();})()");
+ await wait("document.body.innerText.includes('CUSTOM-001 · Fixture requirement')");
+ assert.equal(definitions[0].priority,'HIGH');assert.equal(definitions[0].toolPath,'./check.sh');
+
+ await evaluate("(()=>{const s=[...document.querySelectorAll('select')].find(s=>[...s.options].some(o=>o.value==='english'));s.value='english';s.dispatchEvent(new Event('change'));})()");
+ await wait("document.documentElement.lang==='en' && document.body.innerText.includes('Server identity')");
+
+ await evaluate("[...document.querySelectorAll('button')].find(b=>b.textContent.trim()==='Fleet management').click()");
+ await wait("document.body.innerText.includes('Request audit')");
+ await evaluate("[...document.querySelectorAll('button')].find(b=>b.textContent.trim()==='Request audit').click()");
  for(const text of ['Waiting for consent','Audit running','Fixture audit completed'])await wait(`document.body.innerText.includes('${text}')`);
- assert.ok(await evaluate("document.body.innerText.includes('Requested by Mario Rossi through Company Server')"));assert.equal(await evaluate('window.injected===true'),false);assert.equal(errors.length,0,JSON.stringify(errors));
+ assert.ok(await evaluate("document.body.innerText.includes('Requested by Mario Rossi')"));assert.equal(await evaluate('window.injected===true'),false);assert.equal(errors.length,0,JSON.stringify(errors));
  const screenshot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true});await writeFile('/tmp/bwu-server-dashboard-smoke.png',Buffer.from(screenshot.data,'base64'));
  console.log('PASS: LOCAL session/fleet/pending/running/result, requester, CSRF, XSS escaping, Secure+HttpOnly localhost cookie, no Google login. Fixture API only. Screenshot: /tmp/bwu-server-dashboard-smoke.png');
 }finally{ws?.close();chrome.kill('SIGTERM');if(chrome.exitCode===null)await new Promise(r=>chrome.once('exit',r));await new Promise(r=>server.close(r));await rm(profile,{recursive:true,force:true});}

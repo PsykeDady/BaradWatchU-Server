@@ -1,4 +1,4 @@
-use baradwatchu_server::{config::Config, http::router};
+use baradwatchu_server::config::Config;
 use std::{io, process::ExitCode};
 
 fn main() -> ExitCode {
@@ -58,18 +58,17 @@ async fn run_server(config: Config) -> io::Result<()> {
         }
         println!("BaradWatchU Server shutting down");
     };
-    let routes = if let Some(settings) = config.settings {
-        let store = baradwatchu_server::storage::Store::open(
-            &baradwatchu_server::config::data_dir().map_err(io::Error::other)?,
-        )
-        .map_err(io::Error::other)?;
-        baradwatchu_server::http::application(
-            baradwatchu_server::http::App::new(store, settings).map_err(io::Error::other)?,
-        )
-    } else {
-        eprintln!("Server MVP is disabled: set BARADWATCHU_SERVER_CONFIG (health only)");
-        router()
-    };
+    let settings = config.settings;
+    if !settings.web_path().join("index.html").is_file() {
+        return Err(io::Error::other("dashboard assets missing; rebuild/reinstall the Server or configure webDir"));
+    }
+    println!("Dashboard: {} (mode {:?})", settings.origin(), settings.auth_mode);
+    let store = baradwatchu_server::storage::Store::open(
+        &baradwatchu_server::config::data_dir().map_err(io::Error::other)?,
+    ).map_err(io::Error::other)?;
+    let routes = baradwatchu_server::http::application(
+        baradwatchu_server::http::App::new(store, settings).map_err(io::Error::other)?,
+    );
     axum::serve(listener, routes)
         .with_graceful_shutdown(shutdown)
         .await
@@ -93,13 +92,14 @@ fn handle_cli() -> Result<bool, String> {
     }
     match args.as_slice() {
         [] => Ok(true),
+        [command] if command == "dashboard" => Ok(true),
         [flag] if flag == "--version" || flag == "-V" => {
             println!("BaradWatchU Server {}", env!("CARGO_PKG_VERSION"));
             Ok(false)
         }
         [flag] if flag == "--help" || flag == "-h" => {
             println!(
-                "BaradWatchU Server {}\n\nUsage: baradwatchu-server [OPTIONS]\n\nOptions:\n  -h, --help       Show this help and exit\n  -V, --version    Show product version and exit\n\nThe development server listens at 127.0.0.1:3000 by default. Set\nBARADWATCHU_SERVER_ADDR to an IP address and port (IPv6: [::1]:3000).\nCtrl-C or SIGTERM drains HTTP connections before shutdown on Linux.\nConfigure the dashboard/OIDC with BARADWATCHU_SERVER_CONFIG (local JSON file).\nPersistent state: BARADWATCHU_SERVER_DATA_DIR (owner-only directory).\n\nLocal provisioning:\n  setup identity generate NAME\n  setup identity export\n  setup admin allow GOOGLE_SUB\n  setup admin revoke GOOGLE_SUB\n  setup client import FILE IP:PORT NAME SHA256:FINGERPRINT",
+                "BaradWatchU Server {}\n\nUsage: baradwatchu-server [dashboard | OPTIONS]\n\nOptions:\n  -h, --help       Show this help and exit\n  -V, --version    Show product version and exit\n\nStart without arguments or with dashboard; keep the process running.\nWithout server.json, the full dashboard uses LOCAL authentication on loopback.\nConfiguration: BARADWATCHU_SERVER_CONFIG, /etc/baradwatchu/server.json,\nthen ~/.config/baradwatchu/server.json.\nThe server listens at 127.0.0.1:3000 by default. Set\nBARADWATCHU_SERVER_ADDR to an IP address and port (IPv6: [::1]:3000).\nCtrl-C or SIGTERM drains HTTP connections before shutdown on Linux.\nConfigure the dashboard/OIDC with BARADWATCHU_SERVER_CONFIG (local JSON file).\nPersistent state: BARADWATCHU_SERVER_DATA_DIR (owner-only directory).\n\nLocal provisioning:\n  setup identity generate NAME\n  setup identity export\n  setup admin allow GOOGLE_SUB\n  setup admin revoke GOOGLE_SUB\n  setup client import FILE IP:PORT NAME SHA256:FINGERPRINT",
                 env!("CARGO_PKG_VERSION")
             );
             Ok(false)

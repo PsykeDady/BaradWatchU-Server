@@ -54,6 +54,11 @@ The release executable supports the same flags without starting the HTTP server.
 - GNU/Linux with glibc 2.17+ to build; a cache records the actual build host glibc and conservatively requires the same or a newer version.
 - For the full source build: C/C++ compilers, make, Python 3 and tar (including native npm dependency fallbacks).
 
+The installer follows `web/.nvmrc`: when the active Node is not a supported Node 20, it loads
+the user's nvm installation and selects the pinned runtime before checking or invoking npm.
+This uses the npm paired with that Node and does not require a system Node/npm package when
+nvm already provides Node 20.
+
 ## Commands
 
 From the repository root:
@@ -84,19 +89,23 @@ Use `nvm use` in `web/`. For the complete workflow, build Angular and open the R
 `http://localhost:3000`. Configuration is selected from `BARADWATCHU_SERVER_CONFIG` when
 set; otherwise the Server checks `/etc/baradwatchu/server.json`, then
 `$XDG_CONFIG_HOME/baradwatchu/server.json` (normally `~/.config/baradwatchu/server.json`).
-If no file exists, only `/health` is enabled. An explicitly selected or discovered file that
+If no file exists, the full dashboard starts in loopback-only LOCAL mode. An explicitly selected or discovered file that
 exists but cannot be read causes startup to fail; the Server does not silently choose a
 different authentication mode.
-For Angular live development, `npm start` stays in the foreground on port 4200 and proxies
-`/api` and `/auth` to `127.0.0.1:3000`; use `http://localhost:4200` as `publicUrl`. OIDC also
+For Angular live development, `npm start` stays in the foreground on port 4300 and proxies
+`/api` and `/auth` to `127.0.0.1:3000`; use `http://localhost:4300` as `publicUrl`. OIDC also
 uses its matching Google callback; LOCAL needs no callback. Angular never starts Rust.
 
 ## Authentication mode and local development
 
-Authentication mode is selected by `authMode` in `BARADWATCHU_SERVER_CONFIG`. Omitted
-`authMode` defaults to `OIDC`, preserving the Google login and explicit administrator
-allowlist. The source installer does not select a mode or write runtime configuration;
-`--local` selects only a user-local installation prefix.
+Authentication mode is selected by `authMode` in `server.json`. Missing configuration or
+an omitted `authMode` selects `LOCAL`; `OIDC` must be explicit and still requires Google
+configuration and administrator authorization. Run `baradwatchu-server` or
+`baradwatchu-server dashboard` and keep it running, then open `http://localhost:3000`.
+The source installer defaults to `/usr/local`, builds as your user, then requests sudo
+for file installation. LOCAL describes runtime authentication, not installation permissions.
+An old `~/.local/bin/baradwatchu-server` may shadow the system binary: use the absolute
+`/usr/local/bin/baradwatchu-server` until you remove the older installation explicitly.
 
 For development without OAuth credentials, create a private `server.local.json`:
 
@@ -230,7 +239,46 @@ Client service restart loses in-memory results, Server restart loses routing rec
 and neither erases Client history. The dashboard retains the last request ID in tab storage,
 scoped to the operator, for refresh while the Server process survives.
 
+The dashboard follows the Client's Ash & Ember palette and offers Italian/English selection
+(saved in this browser). Administrators can define Server SHA-256 baselines by requirement ID.
+For each completed audit, the Server compares those values with the matching result's
+`provenance.actualSha256` and `integrityStatus` reported by the trusted Client; the comparison
+is returned alongside the Client report and is not stored as a second audit copy. Hashes in a
+remote report are observations authenticated by the existing mTLS Client connection, not a
+separate signature over the report. Configure only digests obtained from the authoritative
+Client check catalog/package; a baseline does not upload or change checks on a Client.
+
+The result view also opens a printable PDF using the Client renderer (template 1.3.0),
+including original Client version, observations and requester attribution. It renders the
+received JSON without running checks or changing the report. The Client must still hold the
+result; its one-hour retention applies to both JSON and PDF retrieval. Settings exposes the
+same theme selection as the Client: `$XDG_CONFIG_HOME/baradwatchu/report-theme.json` and
+`themes/*.json` (normally under `~/.config/baradwatchu`). This sharing is intentional.
+
+The Server parses the Client audit model, rejects invalid schemas/duplicate requirement IDs,
+and reports inconsistent digest syntax, VERIFIED claims, file states, folder gates and
+installation counters. Historical reports without provenance remain readable with unknown
+evidence. Reported manifest digests are observations; they cannot be recomputed from a list
+of file hashes alone. Independently configured expectations remain separate from Client claims.
+
+The Settings language selector persists `system`, `italian` or `english` in the Client-compatible `baradwatchu/language.json` under the Server account configuration directory. Dashboard labels come from JSON message catalogs through `/api/messages`; PDF rendering reads the same preference. Changing it requires an authorized session and CSRF protection. It is shared with a Client running under the same account, not a per-browser OIDC preference.
+
+### Client requirement definitions
+
+Settings accepts the Client `configuration.json` schema (`baradwatchu.custom-checks.v1`): enabled state, priority, description, parameters, arguments, tool path or providers, timeout, expected SHA-256, version and configuration-only overrides. Paste/edit the JSON, save, export or remove it. Definitions are persisted in the Server SQLite database; only authorized operators may change them, with CSRF protection. The Server neither executes these tools nor distributes configuration to Clients.
+
+On retrieval, reports are compared against definition enabled state, priority, override tool identity when reported, and expected entrypoint hash. Missing evidence is `UNKNOWN`; parameters are not echoed by the current report contract and cannot be checked. Entry-point matching does not verify the whole check folder. Existing explicit SHA baselines remain additional independently configured expectations. Importing a definition never imports trust or creates a Server identity. Independent per-file comparison is described below.
+
+### Independently expected file manifest
+
+In Settings, paste the exact `catalog/builtin-tools.sha256` text from an independently verified Client release. It is stored in SQLite only after an explicit authorized action; the Server never learns expected hashes automatically from a report. The format is the Client's `REQ-ID platform relative-path SHA256` format. One active manifest applies to the fleet; mixed Client releases may legitimately differ. Preserve the original newlines when comparing the complete manifest hash.
+
+Results compare each file's observed digest and the Client's declared expected digest with the imported expectations. Missing, extra, duplicate and unverified files are distinguished. Missing installation evidence or an absent platform is unknown. A complete match requires the exact manifest digest and every expected file with consistent reported identity/state/digests and no extra files. This remains comparison of mTLS-authenticated observations, not proof that checks ran or a report signature. Removing the manifest only removes Server expectations; it changes no Client.
+
 ## Linux source installation
+
+
+Before installation/update or removal changes files, the installer stops running processes of the selected installation owned by the invoking user (also when invoked through sudo). It matches the exact executable path, sends SIGTERM and waits up to 10 seconds; set `BARADWATCHU_STOP_TIMEOUT=1..99` to change this. A timeout aborts before installed files change; no SIGKILL is used. Other users' processes and other installation prefixes are left running and reported. Restart manually with the installed `baradwatchu-server dashboard`. `--dry-run` reports the effective plan without stopping processes. Lifecycle checks: `python3 tools/test-installer-lifecycle.py` (temporary prefixes, no root or actual installation).
 
 Supported installer detection: Arch Linux, Fedora, Debian and Ubuntu, including `ID_LIKE`. `--missing-deps` only inspects dependencies, reports missing local Angular packages and prints package-manager/project commands; it never installs system packages. Required source-build tools are Rust/Cargo 1.88+, Node.js 20 >=20.11.1, npm 8+, C/C++, make, Python 3 and tar; glibc 2.17+ is the minimum checked on the build host. A validated prebuilt cache does not require Node/Angular tooling, but this source installer builds those assets when building from source.
 
@@ -238,13 +286,13 @@ Supported installer detection: Arch Linux, Fedora, Debian and Ubuntu, including 
 ./install.sh --help
 ./install.sh --missing-deps
 ./install.sh --dry-run --prefix=/tmp/baradwatchu-preview
-./install.sh --local                         # limited user development copy
+./install.sh                                  # build as user, install in /usr/local via sudo
 ./install.sh --build-only --build-dir="$HOME/.cache/baradwatchu/baradwatchu-server-0.0.1"
 sudo ./install.sh --no-build --build-dir="$HOME/.cache/baradwatchu/baradwatchu-server-0.0.1" --prefix=/usr/local
 ./install.sh --uninstall --prefix=/usr/local
 ```
 
-`--no-build` requires a complete cache created from this exact source tree, version and host platform. For a system prefix, build as an unprivileged user first, then run the install with `sudo` and `--no-build`; never build as root. `--local` installs under `~/.local` for manual development use. Neither mode creates a service or production configuration. Uninstall removes only unchanged payload files listed in the source manifest; it refuses package-manager-owned or modified files and preserves configuration/data. Updates use the same ownership manifest. No service is restarted.
+`--no-build` requires a complete cache created from this exact source tree, version and host platform. Plain `./install.sh` builds as the current unprivileged user, then uses sudo to install under `/usr/local`. For a system prefix, build as an unprivileged user first, then run the install with `sudo` and `--no-build --prefix=/usr/local`; never build as root. Neither mode creates a service or production configuration. Uninstall removes only unchanged payload files listed in the source manifest; it refuses package-manager-owned or modified files and preserves configuration/data. Updates use the same ownership manifest. No service is restarted.
 
 `--build-only` uses Cargo `--locked` and a temporary Angular workspace inside the cache: `npm ci` does not replace checkout `node_modules`. Dependencies, npm logs and node-gyp headers stay in the cache. Sources must remain unchanged during the build. `-h` aliases `--help`, `-U` aliases `--uninstall`, and `--build-dir=DIR` selects the marked build cache. Exit codes are 0 for success, 1 for execution/validation failures, and 2 for invalid or conflicting options.
 

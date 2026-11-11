@@ -1,9 +1,9 @@
 use std::{env, net::SocketAddr};
 
-/// Startup configuration. Without a discovered file only the health endpoint is exposed.
+/// Startup configuration. Without a discovered file LOCAL is used on loopback.
 pub struct Config {
     pub address: SocketAddr,
-    pub settings: Option<Settings>,
+    pub settings: Settings,
 }
 
 impl Config {
@@ -33,18 +33,23 @@ impl Config {
                 serde_json::from_slice(&bytes).map_err(|_| "invalid Server configuration JSON")?;
             settings.validate()?;
             validate_binding(config.address, &settings)?;
-            config.settings = Some(settings);
+            config.settings = settings;
         }
+        config.settings.validate()?;
+        validate_binding(config.address, &config.settings)?;
         Ok(config)
     }
 
     fn from_address(address: &str) -> Result<Self, String> {
-        let address = address.parse().map_err(|_| {
+        let address: SocketAddr = address.parse().map_err(|_| {
             "BARADWATCHU_SERVER_ADDR must be an IP address and port, e.g. 127.0.0.1:3000 or [::1]:3000".to_owned()
         })?;
         Ok(Self {
             address,
-            settings: None,
+            settings: Settings {
+                public_url: format!("http://localhost:{}", address.port()),
+                ..Settings::default()
+            },
         })
     }
 }
@@ -184,17 +189,16 @@ mod tests {
     }
 
     #[test]
-    fn omitted_mode_preserves_oidc_as_default_and_requires_google() {
-        let json = r#"{"publicUrl":"https://server.example","google":{"clientId":"id","clientSecret":"secret","redirectUri":"https://server.example/auth/callback"}}"#;
+    fn omitted_mode_defaults_to_local_and_oidc_remains_explicit() {
+        let json = r#"{"authMode":"OIDC","publicUrl":"https://server.example","google":{"clientId":"id","clientSecret":"secret","redirectUri":"https://server.example/auth/callback"}}"#;
         let settings: super::Settings = serde_json::from_str(json).unwrap();
         assert_eq!(settings.auth_mode, AuthMode::Oidc);
         assert!(settings.validate().is_ok());
-        assert!(serde_json::from_str::<super::Settings>(
-            r#"{"publicUrl":"http://localhost:3000"}"#
-        )
-        .unwrap()
-        .validate()
-        .is_err());
+        let local: super::Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(local.auth_mode, AuthMode::Local);
+        assert!(local.validate().is_ok());
+        assert!(super::validate_binding("0.0.0.0:3000".parse().unwrap(), &local).is_err());
+        assert!(super::validate_binding("127.0.0.1:3000".parse().unwrap(), &local).is_ok());
     }
 
     #[test]
@@ -246,8 +250,8 @@ pub struct OidcConfig {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum AuthMode {
-    Local,
     #[default]
+    Local,
     Oidc,
 }
 #[derive(Clone, serde::Deserialize)]
@@ -255,6 +259,7 @@ pub enum AuthMode {
 pub struct Settings {
     #[serde(default)]
     pub auth_mode: AuthMode,
+    #[serde(default = "default_public_url")]
     pub public_url: String,
     #[serde(default)]
     pub google: Option<OidcConfig>,
@@ -262,6 +267,12 @@ pub struct Settings {
     pub local_operator_name: Option<String>,
     #[serde(default)]
     pub web_dir: Option<std::path::PathBuf>,
+}
+fn default_public_url() -> String { "http://localhost:3000".into() }
+impl Default for Settings {
+    fn default() -> Self {
+        Self { auth_mode: AuthMode::Local, public_url: default_public_url(), google: None, local_operator_name: None, web_dir: None }
+    }
 }
 impl Settings {
     pub fn validate(&self) -> Result<(), String> {
