@@ -1,11 +1,16 @@
 //! Client configuration.json contract and validation; never resolves or runs a tool.
+use crate::report::{AuditReport, Priority, ResultStatus};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, path::{Path, Component}};
-use crate::report::{Priority, AuditReport, ResultStatus};
+use std::{
+    collections::BTreeMap,
+    path::{Component, Path},
+};
 const CHECK_SCHEMA: &str = "baradwatchu.custom-checks.v1";
 const MAX_TIMEOUT_SECONDS: u64 = 300;
 const MAX_PROVIDERS: usize = 16;
-fn empty_parameters() -> serde_json::Value { serde_json::json!({}) }
+fn empty_parameters() -> serde_json::Value {
+    serde_json::json!({})
+}
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CheckConfiguration {
@@ -215,31 +220,60 @@ fn safe_relative_path(value: &str) -> bool {
             .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
 }
 
-
 impl CheckConfiguration {
     pub fn validate(&self) -> Result<(), String> {
-        if self.id.len()>64 || self.id=="REQ-" || self.id=="CUSTOM-" || !(self.id.starts_with("REQ-") || self.id.starts_with("CUSTOM-")) || !self.id.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b==b'-') {
+        if self.id.len() > 64
+            || self.id == "REQ-"
+            || self.id == "CUSTOM-"
+            || !(self.id.starts_with("REQ-") || self.id.starts_with("CUSTOM-"))
+            || !self
+                .id
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'-')
+        {
             return Err("invalid requirement ID".into());
         }
-        if let Some(id)=&self.override_builtin_id {
-            if !self.id.starts_with("CUSTOM-") || !id.starts_with("REQ-") || id.len()>64 || !id.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b==b'-') {
+        if let Some(id) = &self.override_builtin_id {
+            if !self.id.starts_with("CUSTOM-")
+                || !id.starts_with("REQ-")
+                || id.len() > 64
+                || !id
+                    .bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'-')
+            {
                 return Err("invalid overrideBuiltinId".into());
             }
         }
-        validate_configuration(&self.id,self)
+        validate_configuration(&self.id, self)
     }
-    pub fn compare(&self, report:&AuditReport) -> serde_json::Value {
-        let result_id=self.override_builtin_id.as_deref().unwrap_or(&self.id);
-        let result=report.results.iter().find(|r|r.id==result_id);
-        let enabled=result.map(|r|r.status!=ResultStatus::Disabled);
-        let priority=result.map(|r|r.priority);
-        let provenance=result.and_then(|r|r.provenance.as_ref());
-        let hash=provenance.and_then(|p|p.actual_sha256.as_deref());
-        let hash_state=match (self.expected_sha256.as_deref(),hash) {
-            (Some(expected),Some(actual))=>if expected.eq_ignore_ascii_case(actual){"MATCH"}else{"MISMATCH"},
-            _=>"UNKNOWN",
+    pub fn compare(&self, report: &AuditReport) -> serde_json::Value {
+        let result_id = self.override_builtin_id.as_deref().unwrap_or(&self.id);
+        let result = report.results.iter().find(|r| r.id == result_id);
+        let enabled = result.map(|r| r.status != ResultStatus::Disabled);
+        let priority = result.map(|r| r.priority);
+        let provenance = result.and_then(|r| r.provenance.as_ref());
+        let hash = provenance.and_then(|p| p.actual_sha256.as_deref());
+        let hash_state = match (self.expected_sha256.as_deref(), hash) {
+            (Some(expected), Some(actual)) => {
+                if expected.eq_ignore_ascii_case(actual) {
+                    "MATCH"
+                } else {
+                    "MISMATCH"
+                }
+            }
+            _ => "UNKNOWN",
         };
-        let metadata_state=if result.is_none(){"MISSING"}else if enabled!=Some(self.enabled) || priority!=Some(self.priority) || provenance.is_some_and(|p|self.override_builtin_id.is_some() && p.tool_id!=self.id){"MISMATCH"}else{"MATCH"};
+        let metadata_state = if result.is_none() {
+            "MISSING"
+        } else if enabled != Some(self.enabled)
+            || priority != Some(self.priority)
+            || provenance
+                .is_some_and(|p| self.override_builtin_id.is_some() && p.tool_id != self.id)
+        {
+            "MISMATCH"
+        } else {
+            "MATCH"
+        };
         serde_json::json!({"id":self.id,"resultId":result_id,"name":self.name,"enabled":self.enabled,"reportedEnabled":enabled,"priority":self.priority,"reportedPriority":priority,"metadataState":metadata_state,"expectedSha256":self.expected_sha256,"reportedSha256":hash,"hashState":hash_state,"parametersState":"UNKNOWN"})
     }
 }
@@ -247,61 +281,108 @@ impl CheckConfiguration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::{json,Value};
-    fn sample()->CheckConfiguration {
+    use serde_json::{json, Value};
+    fn sample() -> CheckConfiguration {
         serde_json::from_value(json!({"schemaVersion":CHECK_SCHEMA,"id":"CUSTOM-001","name":"Test","description":"","priority":"HIGH","enabled":true,"toolPath":"./check.sh","expectedSha256":"a".repeat(64)})).unwrap()
     }
     #[test]
     fn client_catalog_definitions_validate_and_roundtrip() {
         // Snapshot of all nine Client catalog configurations, including providers.
-        let fixtures:Vec<Value>=serde_json::from_str(include_str!("../tests/fixtures/client-check-configurations.json")).unwrap();
-        assert_eq!(fixtures.len(),9);
+        let fixtures: Vec<Value> = serde_json::from_str(include_str!(
+            "../tests/fixtures/client-check-configurations.json"
+        ))
+        .unwrap();
+        assert_eq!(fixtures.len(), 9);
         for fixture in fixtures {
-            let config:CheckConfiguration=serde_json::from_value(fixture.clone()).unwrap();
+            let config: CheckConfiguration = serde_json::from_value(fixture.clone()).unwrap();
             config.validate().unwrap();
-            let encoded=serde_json::to_value(&config).unwrap();
-            fn preserves(got:&Value, original:&Value) {
-                if let Some(object)=original.as_object(){for (key,value) in object {preserves(&got[key],value);}}
-                else {assert_eq!(got,original);}
+            let encoded = serde_json::to_value(&config).unwrap();
+            fn preserves(got: &Value, original: &Value) {
+                if let Some(object) = original.as_object() {
+                    for (key, value) in object {
+                        preserves(&got[key], value);
+                    }
+                } else {
+                    assert_eq!(got, original);
+                }
             }
-            preserves(&encoded,&fixture);
-            let decoded:CheckConfiguration=serde_json::from_value(encoded).unwrap();
+            preserves(&encoded, &fixture);
+            let decoded: CheckConfiguration = serde_json::from_value(encoded).unwrap();
             decoded.validate().unwrap();
         }
     }
     #[test]
     fn configuration_only_override_and_provider_constraints_match_client() {
-        let mut config=sample();
-        config.tool_path=None; config.expected_sha256=None; config.override_builtin_id=Some("REQ-001".into());
+        let mut config = sample();
+        config.tool_path = None;
+        config.expected_sha256 = None;
+        config.override_builtin_id = Some("REQ-001".into());
         config.validate().unwrap();
-        config.expected_sha256=Some("a".repeat(64));assert!(config.validate().is_err());
-        config=sample();config.tool_path=Some("../outside.sh".into());assert!(config.validate().is_err());
-        config=sample();config.timeout_seconds=Some(301);assert!(config.validate().is_err());
-        config=sample();config.parameters=json!([]);assert!(config.validate().is_err());
-        config=sample();config.tool_path=None;config.expected_sha256=None;
-        config.providers.insert("first".into(),ProviderConfiguration{name:"First".into(),tool_path:"./first.sh".into(),parameters:json!({}),timeout_seconds:Some(30)});
-        config.parameters=json!({"acceptedProviders":["missing"]});assert!(config.validate().is_err());
-        config.parameters=json!({"acceptedProviders":["first"]});config.validate().unwrap();
+        config.expected_sha256 = Some("a".repeat(64));
+        assert!(config.validate().is_err());
+        config = sample();
+        config.tool_path = Some("../outside.sh".into());
+        assert!(config.validate().is_err());
+        config = sample();
+        config.timeout_seconds = Some(301);
+        assert!(config.validate().is_err());
+        config = sample();
+        config.parameters = json!([]);
+        assert!(config.validate().is_err());
+        config = sample();
+        config.tool_path = None;
+        config.expected_sha256 = None;
+        config.providers.insert(
+            "first".into(),
+            ProviderConfiguration {
+                name: "First".into(),
+                tool_path: "./first.sh".into(),
+                parameters: json!({}),
+                timeout_seconds: Some(30),
+            },
+        );
+        config.parameters = json!({"acceptedProviders":["missing"]});
+        assert!(config.validate().is_err());
+        config.parameters = json!({"acceptedProviders":["first"]});
+        config.validate().unwrap();
     }
     #[test]
     fn definition_persistence_replaces_by_id_without_creating_identity() {
-        let store=crate::storage::Store::memory();let mut config=sample();
+        let store = crate::storage::Store::memory();
+        let mut config = sample();
         store.save_requirement_definition(&config).unwrap();
-        config.enabled=false;config.parameters=json!({"limit":7});
+        config.enabled = false;
+        config.parameters = json!({"limit":7});
         store.save_requirement_definition(&config).unwrap();
-        let saved=store.requirement_definitions().unwrap();assert_eq!(saved.len(),1);assert!(!saved[0].enabled);assert_eq!(saved[0].parameters["limit"],7);
+        let saved = store.requirement_definitions().unwrap();
+        assert_eq!(saved.len(), 1);
+        assert!(!saved[0].enabled);
+        assert_eq!(saved[0].parameters["limit"], 7);
         assert!(store.identity().unwrap().is_none());
-        config.tool_path=Some("/tmp/check".into());assert!(store.save_requirement_definition(&config).is_err());
-        assert_eq!(store.requirement_definitions().unwrap()[0].tool_path.as_deref(),Some("./check.sh"));
-        store.remove_requirement_definition(&config.id).unwrap();assert!(store.requirement_definitions().unwrap().is_empty());
+        config.tool_path = Some("/tmp/check".into());
+        assert!(store.save_requirement_definition(&config).is_err());
+        assert_eq!(
+            store.requirement_definitions().unwrap()[0]
+                .tool_path
+                .as_deref(),
+            Some("./check.sh")
+        );
+        store.remove_requirement_definition(&config.id).unwrap();
+        assert!(store.requirement_definitions().unwrap().is_empty());
     }
     #[test]
     fn compares_metadata_and_hash_but_never_invents_parameter_evidence() {
-        let mut config=sample();
+        let mut config = sample();
         let mut report:AuditReport=serde_json::from_value(json!({"schemaVersion":"baradwatchu.audit.v1","completedAtUnixMs":1,"results":[{"id":"CUSTOM-001","name":"Test","priority":"HIGH","status":"PASS","summary":"ok","details":[],"completedAtUnixMs":1}]})).unwrap();
-        let compared=config.compare(&report);assert_eq!(compared["metadataState"],"MATCH");assert_eq!(compared["hashState"],"UNKNOWN");assert_eq!(compared["parametersState"],"UNKNOWN");
-        config.enabled=false;assert_eq!(config.compare(&report)["metadataState"],"MISMATCH");
-        report.results[0].status=ResultStatus::Disabled;assert_eq!(config.compare(&report)["metadataState"],"MATCH");
-        report.results.clear();assert_eq!(config.compare(&report)["metadataState"],"MISSING");
+        let compared = config.compare(&report);
+        assert_eq!(compared["metadataState"], "MATCH");
+        assert_eq!(compared["hashState"], "UNKNOWN");
+        assert_eq!(compared["parametersState"], "UNKNOWN");
+        config.enabled = false;
+        assert_eq!(config.compare(&report)["metadataState"], "MISMATCH");
+        report.results[0].status = ResultStatus::Disabled;
+        assert_eq!(config.compare(&report)["metadataState"], "MATCH");
+        report.results.clear();
+        assert_eq!(config.compare(&report)["metadataState"], "MISSING");
     }
 }

@@ -240,4 +240,3 @@ pub struct ProviderResult {
     #[serde(default)]
     pub details: Vec<String>,
 }
-

@@ -15,8 +15,8 @@ Ed25519 pairing, trusted Client inventory, remote requests/status/results and JS
 Client audit execution, consent and local history remain in the Client.
 
 - `crates/server/src/auth.rs`: Google discovery, code exchange and signed token validation;
-  tokens stay in the backend and are discarded. LOCAL creates only a loopback session with a
-  descriptive operator label. Cookies are Secure, HttpOnly, SameSite=Lax, host-only; mutations
+  tokens stay in the backend and are discarded. LOCAL issues a random, eight-hour loopback session with a
+  descriptive operator label only to a browser presenting the launch token (Client model, see below); logout revokes it and the next session receives fresh tokens. Cookies are Secure, HttpOnly, SameSite=Lax, host-only; mutations
   require session CSRF token and exact Origin.
 - `storage.rs`: SQLite identity seed, trusted Client public keys/endpoints, administrators
   keyed by Google issuer + subject (with latest verified display name/email). Owner-only
@@ -27,11 +27,11 @@ Client audit execution, consent and local history remain in the Client.
   allowlist on each request; LOCAL relies on its enforced loopback listener. OIDC admin
   revocation affects already-open sessions.
 - Sessions (8 hours) and routing records (24 hours; up to 4096 requests) are in memory and
-  lost on Server restart. No Server audit database: results are fetched from the Client,
+  lost on Server restart. Received reports are retained in the existing SQLite database after retrieval from the Client,
   which retains completed results for one hour in memory and keeps local history separately.
   Each operator can retrieve their own requests. One Server process per data directory.
 
-Policy assignment/comparison, historical Server audit storage, scheduling, remediation,
+Policy distribution, scheduling, remediation,
 complex roles, multi-tenancy, discovery, native packages and Server service packaging remain
 outside this MVP. The source installer still does not create a system service.
 
@@ -100,8 +100,20 @@ uses its matching Google callback; LOCAL needs no callback. Angular never starts
 
 Authentication mode is selected by `authMode` in `server.json`. Missing configuration or
 an omitted `authMode` selects `LOCAL`; `OIDC` must be explicit and still requires Google
-configuration and administrator authorization. Run `baradwatchu-server` or
-`baradwatchu-server dashboard` and keep it running, then open `http://localhost:3000`.
+configuration and administrator authorization. Run `baradwatchu-server dashboard
+[--no-browser]` and keep it running (plain `baradwatchu-server` starts without a browser).
+
+LOCAL launch follows the Client dashboard: at startup the Server generates a random 64-hex launch
+token and writes `{schemaVersion, pid, origin, port, token}` to
+`$XDG_RUNTIME_DIR/baradwatchu-server/dashboard.json` (fallback `<data dir>/run`; directory 0700,
+file 0600), prints the `http://localhost:3000/?k=TOKEN` link and opens it through the private
+`open-dashboard.html` launcher, so the token is never on a command line. The browser keeps the
+token per tab (sessionStorage), removes it from the address bar, and exchanges it once via the
+`X-BaradWatchU-Token` header on `/api/session` for the HttpOnly cookie/CSRF session. Without the
+token `/api/session` answers 401 `LOCAL_TOKEN_REQUIRED`. Running `dashboard` again as the same
+user reuses the live session (port reachable and PID running the same executable), like the
+Client; the record is removed at shutdown. Only the user who started the Server can read the
+token. The Client uses `$XDG_RUNTIME_DIR/baradwatchu/` and an ephemeral port, so both coexist.
 The source installer defaults to `/usr/local`, builds as your user, then requests sudo
 for file installation. LOCAL describes runtime authentication, not installation permissions.
 An old `~/.local/bin/baradwatchu-server` may shadow the system binary: use the absolute
@@ -130,15 +142,16 @@ Build the Angular dashboard with `(cd web && npm run build)` and open
 `LOGNAME`/`USERNAME`, then the generic `Operatore locale` label. This is a descriptive label only:
 loopback access does not authenticate the browser user, and a system service may resolve
 its own service account. LOCAL requires `127.0.0.1` or `::1`, HTTP localhost public URL,
-and any port; startup fails on wildcard/non-loopback bindings. It trusts no Host or
-forwarded headers. Use it only on a trusted development/local machine; do not put it behind
+and any port; startup fails on wildcard/non-loopback bindings. Browser `Host` headers other than the
+configured origin or `127.0.0.1`/`[::1]`/`localhost` with the listen port are refused (421
+`INVALID_HOST`, DNS-rebinding guard); forwarded headers are never trusted. Use it only on a trusted development/local machine; do not put it behind
 a public reverse proxy. Server identity pairing, Client mTLS, explicit consent and the
 Client's 120-second consent window are unchanged.
 
-To switch back, set `"authMode": "OIDC"` (or omit it) and restore the `google` block from
+To switch back, set `"authMode": "OIDC"` (omitting it selects LOCAL) and restore the `google` block from
 `server.example.json` with real local credentials. Restart the Server. `/api/auth-mode`
 reports `OIDC`, `/api/session` returns 401 before Google login, and `/auth/login` starts the
-existing OIDC flow; the LOCAL session endpoint does not issue a session cookie in OIDC mode.
+existing OIDC flow; the LOCAL session endpoint does not issue a session cookie in OIDC mode. LOCAL logout ends the current browser session; it does not identify or sign out the OS user. A new session again requires the launch token (kept by the same tab or reopened with `baradwatchu-server dashboard`).
 
 ## Google OAuth setup
 
@@ -240,7 +253,7 @@ and neither erases Client history. The dashboard retains the last request ID in 
 scoped to the operator, for refresh while the Server process survives.
 
 The dashboard follows the Client's Ash & Ember palette and offers Italian/English selection
-(saved in this browser). Administrators can define Server SHA-256 baselines by requirement ID.
+(shared with the Client through language.json). Administrators can define Server SHA-256 baselines by requirement ID.
 For each completed audit, the Server compares those values with the matching result's
 `provenance.actualSha256` and `integrityStatus` reported by the trusted Client; the comparison
 is returned alongside the Client report and is not stored as a second audit copy. Hashes in a
@@ -274,6 +287,23 @@ On retrieval, reports are compared against definition enabled state, priority, o
 In Settings, paste the exact `catalog/builtin-tools.sha256` text from an independently verified Client release. It is stored in SQLite only after an explicit authorized action; the Server never learns expected hashes automatically from a report. The format is the Client's `REQ-ID platform relative-path SHA256` format. One active manifest applies to the fleet; mixed Client releases may legitimately differ. Preserve the original newlines when comparing the complete manifest hash.
 
 Results compare each file's observed digest and the Client's declared expected digest with the imported expectations. Missing, extra, duplicate and unverified files are distinguished. Missing installation evidence or an absent platform is unknown. A complete match requires the exact manifest digest and every expected file with consistent reported identity/state/digests and no extra files. This remains comparison of mTLS-authenticated observations, not proof that checks ran or a report signature. Removing the manifest only removes Server expectations; it changes no Client.
+
+The extended real-Client tests also verify Server history after Client shutdown, operator isolation/revocation, deletion, and byte-for-byte PDF equality with the Client under the same default theme and English language. Run with isolated Server preferences:
+
+```sh
+python3 tools/test-remote-history.py --client /absolute/path/to/baradwatchu-agent
+# Optional: --artifacts /tmp/baradwatchu-pdf-review
+```
+
+The fixture disables the nine built-in checks for a fast transport/consent/report test and accepts consent through the Client CLI. It does not validate privileged checks, human consent windows or real Google login.
+
+The Client PDF header labels remote and local origin separately; legacy reports without attribution use an unknown-origin label.
+
+### Received report history
+
+The History tab lists your retrieved reports with Client identity, completion time, JSON byte usage, open/download/print actions and delete/clear confirmations. An opened report, like the Client view, sorts findings by severity (ERROR, FAIL, WARN, …) and offers status counter filters plus search by ID or name. JSON is retained in the existing private Server SQLite database, including original fields unknown to this Server version. No audit is generated. Unlike the Client's single-account file cache, the Server uses its database to scope copies by operator and request ID (timestamps can collide across Clients). PDFs are rendered on demand from saved JSON using the Client renderer and shared theme; no additional PDF file is retained.
+
+Reports survive Server restarts and the Client's one-hour remote cache expiration, until explicitly deleted. Only the requesting operator may access them, and OIDC still checks current admin authorization. Removing Client trust prevents new remote retrieval but leaves already received history available. Repeated retrieval is idempotent; changed content under the same request ID is rejected. Deletion is local to the Server; retrieving the remote result again can save a new copy. Comparisons use current Server expectations. Usage counts JSON payload bytes, not SQLite disk allocation; deletion releases logical records without guaranteeing an immediate database-file shrink. No automatic retention policy is configured.
 
 ## Linux source installation
 

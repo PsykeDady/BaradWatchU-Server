@@ -1,16 +1,27 @@
-use baradwatchu_server::config::Config;
+use baradwatchu_server::{config::Config, launcher};
 use std::{io, process::ExitCode};
 
+/// What the command line asked for.
+#[derive(Debug, PartialEq)]
+enum Start {
+    /// Informational/provisioning command already handled.
+    Done,
+    /// Plain start: serve; never opens a browser.
+    Serve,
+    /// `dashboard [--no-browser]`: reuse a live session or start one, like the Client.
+    Dashboard { open_browser: bool },
+}
+
 fn main() -> ExitCode {
-    match handle_cli() {
-        Ok(false) => return ExitCode::SUCCESS,
-        Ok(true) => {}
+    let start_mode = match handle_cli() {
+        Ok(Start::Done) => return ExitCode::SUCCESS,
+        Ok(mode) => mode,
         Err(error) => {
             eprintln!("Error: {error}");
             return ExitCode::from(2);
         }
-    }
-    match start() {
+    };
+    match start(start_mode) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("Error: {error}");
@@ -26,13 +37,31 @@ fn runtime() -> io::Result<tokio::runtime::Runtime> {
         .build()
 }
 
-fn start() -> Result<(), Box<dyn std::error::Error>> {
+fn start(mode: Start) -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
-    runtime()?.block_on(run_server(config))?;
+    let open_browser = mode == (Start::Dashboard { open_browser: true });
+    let local = config.settings.auth_mode == baradwatchu_server::config::AuthMode::Local;
+    if local && matches!(mode, Start::Dashboard { .. }) {
+        let dir = launcher::runtime_dir()?;
+        if let Some(session) = launcher::read_session(&dir).filter(launcher::session_alive) {
+            let language = baradwatchu_messages::configured_language();
+            println!(
+                "{}",
+                baradwatchu_messages::message("cli.dashboard.already_running", language)
+                    .replace("{url}", &session.url())
+                    .trim_end()
+            );
+            if open_browser {
+                launcher::open_in_browser(&dir, &session.url());
+            }
+            return Ok(());
+        }
+    }
+    runtime()?.block_on(run_server(config, open_browser))?;
     Ok(())
 }
 
-async fn run_server(config: Config) -> io::Result<()> {
+async fn run_server(config: Config, open_browser: bool) -> io::Result<()> {
     let listener = tokio::net::TcpListener::bind(config.address).await.map_err(|error| {
         io::Error::new(error.kind(), format!("cannot listen on {}: {error}; check the address, port availability and permissions", config.address))
     })?;
@@ -60,22 +89,65 @@ async fn run_server(config: Config) -> io::Result<()> {
     };
     let settings = config.settings;
     if !settings.web_path().join("index.html").is_file() {
-        return Err(io::Error::other("dashboard assets missing; rebuild/reinstall the Server or configure webDir"));
+        return Err(io::Error::other(
+            "dashboard assets missing; rebuild/reinstall the Server or configure webDir",
+        ));
     }
-    println!("Dashboard: {} (mode {:?})", settings.origin(), settings.auth_mode);
     let store = baradwatchu_server::storage::Store::open(
         &baradwatchu_server::config::data_dir().map_err(io::Error::other)?,
-    ).map_err(io::Error::other)?;
-    let routes = baradwatchu_server::http::application(
-        baradwatchu_server::http::App::new(store, settings).map_err(io::Error::other)?,
+    )
+    .map_err(io::Error::other)?;
+    let origin = settings.origin().to_owned();
+    let app = baradwatchu_server::http::App::with_listen_address(store, settings, Some(address))
+        .map_err(io::Error::other)?;
+    // LOCAL: publish the launch token only in the owner's private runtime folder (Client model).
+    let runtime = match app.launch_token() {
+        Some(token) => {
+            let dir = launcher::runtime_dir().map_err(io::Error::other)?;
+            let session = launcher::Session {
+                schema_version: launcher::SESSION_SCHEMA.into(),
+                pid: std::process::id(),
+                origin: origin.clone(),
+                port: address.port(),
+                token: token.to_owned(),
+            };
+            launcher::write_session(&dir, &session).map_err(io::Error::other)?;
+            Some((dir, session.url()))
+        }
+        None => None,
+    };
+    let url = runtime
+        .as_ref()
+        .map_or_else(|| origin.clone(), |(_, url)| url.clone());
+    let language = baradwatchu_messages::configured_language();
+    println!(
+        "{}",
+        baradwatchu_messages::message("cli.dashboard.started", language)
+            .replace("{url}", &url)
+            .trim_end()
     );
-    axum::serve(listener, routes)
+    if open_browser {
+        match &runtime {
+            Some((dir, url)) => launcher::open_in_browser(dir, url),
+            None => {
+                // OIDC: the public origin carries no secret; still use the private launcher.
+                if let Ok(dir) = launcher::runtime_dir() {
+                    launcher::open_in_browser(&dir, &url);
+                }
+            }
+        }
+    }
+    let result = axum::serve(listener, baradwatchu_server::http::application(app))
         .with_graceful_shutdown(shutdown)
-        .await
+        .await;
+    if let Some((dir, _)) = &runtime {
+        launcher::remove_session(dir);
+    }
+    result
 }
 
-/// Return whether normal startup was requested; informational flags start no runtime.
-fn handle_cli() -> Result<bool, String> {
+/// Parse the command line; informational flags start no runtime.
+fn handle_cli() -> Result<Start, String> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     if args.first().is_some_and(|s| s == "setup") {
         let values: Vec<String> = args
@@ -88,21 +160,30 @@ fn handle_cli() -> Result<bool, String> {
             })
             .collect::<Result<_, _>>()?;
         provision(&values)?;
-        return Ok(false);
+        return Ok(Start::Done);
     }
-    match args.as_slice() {
-        [] => Ok(true),
-        [command] if command == "dashboard" => Ok(true),
+    parse_start(&args)
+}
+
+fn parse_start(args: &[std::ffi::OsString]) -> Result<Start, String> {
+    match args {
+        [] => Ok(Start::Serve),
+        [command] if command == "dashboard" => Ok(Start::Dashboard { open_browser: true }),
+        [command, flag] if command == "dashboard" && flag == "--no-browser" => {
+            Ok(Start::Dashboard {
+                open_browser: false,
+            })
+        }
         [flag] if flag == "--version" || flag == "-V" => {
             println!("BaradWatchU Server {}", env!("CARGO_PKG_VERSION"));
-            Ok(false)
+            Ok(Start::Done)
         }
         [flag] if flag == "--help" || flag == "-h" => {
             println!(
-                "BaradWatchU Server {}\n\nUsage: baradwatchu-server [dashboard | OPTIONS]\n\nOptions:\n  -h, --help       Show this help and exit\n  -V, --version    Show product version and exit\n\nStart without arguments or with dashboard; keep the process running.\nWithout server.json, the full dashboard uses LOCAL authentication on loopback.\nConfiguration: BARADWATCHU_SERVER_CONFIG, /etc/baradwatchu/server.json,\nthen ~/.config/baradwatchu/server.json.\nThe server listens at 127.0.0.1:3000 by default. Set\nBARADWATCHU_SERVER_ADDR to an IP address and port (IPv6: [::1]:3000).\nCtrl-C or SIGTERM drains HTTP connections before shutdown on Linux.\nConfigure the dashboard/OIDC with BARADWATCHU_SERVER_CONFIG (local JSON file).\nPersistent state: BARADWATCHU_SERVER_DATA_DIR (owner-only directory).\n\nLocal provisioning:\n  setup identity generate NAME\n  setup identity export\n  setup admin allow GOOGLE_SUB\n  setup admin revoke GOOGLE_SUB\n  setup client import FILE IP:PORT NAME SHA256:FINGERPRINT",
+                "BaradWatchU Server {}\n\nUsage: baradwatchu-server [dashboard [--no-browser] | OPTIONS]\n\nOptions:\n  -h, --help       Show this help and exit\n  -V, --version    Show product version and exit\n\nStart without arguments (no browser) or with dashboard, which reuses a running\nLOCAL Server of this user or starts one and opens the browser; keep it running.\nWithout server.json, the full dashboard uses LOCAL authentication on loopback:\nthe launch link carries a random token stored only in\n$XDG_RUNTIME_DIR/baradwatchu-server/dashboard.json (owner-only).\nConfiguration: BARADWATCHU_SERVER_CONFIG, /etc/baradwatchu/server.json,\nthen ~/.config/baradwatchu/server.json.\nThe server listens at 127.0.0.1:3000 by default. Set\nBARADWATCHU_SERVER_ADDR to an IP address and port (IPv6: [::1]:3000).\nCtrl-C or SIGTERM drains HTTP connections before shutdown on Linux.\nConfigure the dashboard/OIDC with BARADWATCHU_SERVER_CONFIG (local JSON file).\nPersistent state: BARADWATCHU_SERVER_DATA_DIR (owner-only directory).\n\nLocal provisioning:\n  setup identity generate NAME\n  setup identity export\n  setup admin allow GOOGLE_SUB\n  setup admin revoke GOOGLE_SUB\n  setup client import FILE IP:PORT NAME SHA256:FINGERPRINT",
                 env!("CARGO_PKG_VERSION")
             );
-            Ok(false)
+            Ok(Start::Done)
         }
         _ => Err("invalid arguments; use --help for usage".to_owned()),
     }
@@ -132,6 +213,34 @@ fn provision(args: &[String]) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dashboard_command_matches_client_options() {
+        use super::{parse_start, Start};
+        let args = |values: &[&str]| {
+            values
+                .iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(parse_start(&args(&[])).unwrap(), Start::Serve);
+        assert_eq!(
+            parse_start(&args(&["dashboard"])).unwrap(),
+            Start::Dashboard { open_browser: true }
+        );
+        assert_eq!(
+            parse_start(&args(&["dashboard", "--no-browser"])).unwrap(),
+            Start::Dashboard {
+                open_browser: false
+            }
+        );
+        for bad in [
+            &["--no-browser"][..],
+            &["dashboard", "--open"],
+            &["dashboard", "--no-browser", "x"],
+        ] {
+            assert!(parse_start(&args(bad)).is_err());
+        }
+    }
     #[test]
     fn startup_runtime_enables_drivers() {
         super::runtime().unwrap().block_on(async {

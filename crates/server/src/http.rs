@@ -24,6 +24,10 @@ pub struct App {
     pub settings: Settings,
     requests: Mutex<HashMap<String, RequestRecord>>,
     connections: tokio::sync::Semaphore,
+    /// LOCAL only: random token written by the launcher to a private runtime file (Client model).
+    launch_token: Option<String>,
+    /// LOCAL only: Host header values accepted from browsers (DNS-rebinding guard).
+    allowed_hosts: Vec<String>,
 }
 #[derive(Clone)]
 struct RequestRecord {
@@ -37,7 +41,37 @@ fn requester_metadata(operator_name: &str, server_name: &str) -> Value {
 }
 impl App {
     pub fn new(store: Store, settings: Settings) -> Result<Arc<Self>, String> {
+        Self::with_listen_address(store, settings, None)
+    }
+    pub fn with_listen_address(
+        store: Store,
+        settings: Settings,
+        listen: Option<std::net::SocketAddr>,
+    ) -> Result<Arc<Self>, String> {
         settings.validate()?;
+        let local = settings.auth_mode == crate::config::AuthMode::Local;
+        let launch_token = if local {
+            Some(storage::random()?)
+        } else {
+            None
+        };
+        let mut allowed_hosts = Vec::new();
+        if local {
+            let url = url::Url::parse(settings.origin()).map_err(|_| "invalid publicUrl")?;
+            let host = match url.host() {
+                Some(url::Host::Ipv6(ip)) => format!("[{ip}]"),
+                Some(host) => host.to_string(),
+                None => return Err("invalid publicUrl".into()),
+            };
+            let port = url.port_or_known_default().ok_or("invalid publicUrl")?;
+            allowed_hosts.push(format!("{host}:{port}"));
+            if let Some(address) = listen {
+                let port = address.port();
+                for host in ["127.0.0.1", "[::1]", "localhost"] {
+                    allowed_hosts.push(format!("{host}:{port}"));
+                }
+            }
+        }
         let auth = Auth::new(
             settings.google.clone(),
             settings.local_operator_name.clone(),
@@ -48,8 +82,26 @@ impl App {
             settings,
             requests: Mutex::new(HashMap::new()),
             connections: tokio::sync::Semaphore::new(16),
+            launch_token,
+            allowed_hosts,
         }))
     }
+    /// The LOCAL launch token; `None` in OIDC mode.
+    pub fn launch_token(&self) -> Option<&str> {
+        self.launch_token.as_deref()
+    }
+}
+/// Constant-time comparison, as in the Client dashboard.
+fn token_matches(expected: &str, provided: Option<&str>) -> bool {
+    let Some(provided) = provided else {
+        return false;
+    };
+    expected.len() == provided.len()
+        && expected
+            .bytes()
+            .zip(provided.bytes())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0
 }
 type ApiResult = Result<Response, ApiError>;
 struct ApiError(StatusCode, String);
@@ -79,25 +131,78 @@ pub fn application(app: Arc<App>) -> Router {
         .route("/api/identity", get(identity))
         .route("/api/identity/generate", post(generate))
         .route("/api/clients", get(clients).post(import_client))
-        .route("/api/requirements", get(requirements).post(save_requirement))
-        .route("/api/requirements/{id}", axum::routing::delete(remove_requirement))
+        .route(
+            "/api/requirements",
+            get(requirements).post(save_requirement),
+        )
+        .route(
+            "/api/requirements/{id}",
+            axum::routing::delete(remove_requirement),
+        )
         .route("/api/clients/{id}", axum::routing::delete(remove_client))
         .route("/api/clients/{id}/requests", post(create_request))
         .route("/api/requests/{id}", get(request_status))
         .route("/api/requests/{id}/result", get(request_result))
         .route("/api/requests/{id}/pdf", get(request_pdf))
-        .route("/api/expected-manifest", get(expected_manifest).put(save_expected_manifest).delete(remove_expected_manifest))
-        .route("/api/requirement-definitions", get(requirement_definitions).post(save_requirement_definition))
-        .route("/api/requirement-definitions/{id}", axum::routing::delete(remove_requirement_definition))
+        .route("/api/history", get(history).delete(clear_history))
+        .route("/api/history/usage", get(history_usage))
+        .route(
+            "/api/history/{id}",
+            get(history_report).delete(delete_history),
+        )
+        .route("/api/history/{id}/pdf", get(history_pdf))
+        .route(
+            "/api/expected-manifest",
+            get(expected_manifest)
+                .put(save_expected_manifest)
+                .delete(remove_expected_manifest),
+        )
+        .route(
+            "/api/requirement-definitions",
+            get(requirement_definitions).post(save_requirement_definition),
+        )
+        .route(
+            "/api/requirement-definitions/{id}",
+            axum::routing::delete(remove_requirement_definition),
+        )
         .route("/api/messages", get(messages))
-        .route("/api/configuration/language", get(language).put(update_language))
-        .route("/api/report-theme", get(report_theme).put(update_report_theme))
-        .with_state(app)
+        .route(
+            "/api/configuration/language",
+            get(language).put(update_language),
+        )
+        .route(
+            "/api/report-theme",
+            get(report_theme).put(update_report_theme),
+        )
+        .with_state(app.clone())
         .fallback_service(
             tower_http::services::ServeDir::new(web).append_index_html_on_directories(true),
         )
         .layer(DefaultBodyLimit::max(32 * 1024))
+        .layer(axum::middleware::from_fn_with_state(app, local_host_guard))
         .layer(axum::middleware::from_fn(security_headers))
+}
+/// LOCAL: a browser always sends Host; refuse names other than the configured loopback
+/// origin so a DNS-rebinding page cannot read the dashboard (Client checks Host likewise).
+async fn local_host_guard(
+    State(app): State<Arc<App>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if app.auth.is_local() {
+        if let Some(host) = request.headers().get(header::HOST) {
+            let allowed = host.to_str().is_ok_and(|host| {
+                app.allowed_hosts
+                    .iter()
+                    .any(|allowed| allowed.eq_ignore_ascii_case(host))
+            });
+            if !allowed {
+                return ApiError(StatusCode::MISDIRECTED_REQUEST, "INVALID_HOST".into())
+                    .into_response();
+            }
+        }
+    }
+    next.run(request).await
 }
 async fn security_headers(
     request: axum::extract::Request,
@@ -105,7 +210,22 @@ async fn security_headers(
 ) -> Response {
     let mut response = next.run(request).await;
     let h = response.headers_mut();
-    for (name,value) in [("cache-control","no-store"),("referrer-policy","no-referrer"),("x-content-type-options","nosniff"),("x-frame-options","DENY"),("content-security-policy","default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"),("strict-transport-security","max-age=31536000")] {h.insert(axum::http::HeaderName::from_static(name),axum::http::HeaderValue::from_static(value));}
+    for (name, value) in [
+        ("cache-control", "no-store"),
+        ("referrer-policy", "no-referrer"),
+        ("x-content-type-options", "nosniff"),
+        ("x-frame-options", "DENY"),
+        (
+            "content-security-policy",
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
+        ),
+        ("strict-transport-security", "max-age=31536000"),
+    ] {
+        h.insert(
+            axum::http::HeaderName::from_static(name),
+            axum::http::HeaderValue::from_static(value),
+        );
+    }
     response
 }
 async fn health() -> Json<Value> {
@@ -220,8 +340,29 @@ async fn callback(
     Ok(response)
 }
 async fn session(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult {
-    let (s, local_token) = if let Some((token, local)) = app.auth.local_session() {
-        (local, Some(token))
+    let (s, local_token) = if app.auth.is_local() {
+        match auth::read_cookie(&headers, auth::SESSION_COOKIE)
+            .and_then(|token| app.auth.session(&token).map(|session| (token, session)))
+        {
+            Some(pair) => (pair.1, Some(pair.0)),
+            None => {
+                // Like the Client token: only the owner of the private runtime file can start a session.
+                let provided = headers
+                    .get("x-baradwatchu-token")
+                    .and_then(|value| value.to_str().ok());
+                if !app
+                    .launch_token()
+                    .is_some_and(|expected| token_matches(expected, provided))
+                {
+                    return Err(ApiError(
+                        StatusCode::UNAUTHORIZED,
+                        "LOCAL_TOKEN_REQUIRED".into(),
+                    ));
+                }
+                let (token, session) = app.auth.local_session().map_err(unavailable)?;
+                (session, Some(token))
+            }
+        }
     } else {
         (authenticated(&app, &headers)?, None)
     };
@@ -238,7 +379,7 @@ async fn session(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult {
                     email: s.operator.email.clone().unwrap_or_default(),
                 })
             });
-    let mut response = Json(json!({"mode":if app.auth.is_local(){"LOCAL"}else{"OIDC"},"operator":s.operator,"authorized":authorized,"csrf":s.csrf})).into_response();
+    let mut response=Json(json!({"mode":if app.auth.is_local(){"LOCAL"}else{"OIDC"},"operator":s.operator,"authorized":authorized,"csrf":s.csrf})).into_response();
     if let Some(token) = local_token {
         set_cookie(&mut response, auth::session_cookie(&token));
     }
@@ -251,7 +392,9 @@ async fn logout(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult {
     let s = authenticated(&app, &headers)?;
     csrf(&app, &headers, &s)?;
     if let Some(token) = auth::read_cookie(&headers, auth::SESSION_COOKIE) {
-        if !app.auth.is_local() {
+        if app.auth.is_local() {
+            app.auth.revoke_local_session(&token);
+        } else {
             app.auth.logout(&token);
         }
     }
@@ -324,17 +467,37 @@ async fn requirements(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiRes
     Ok(Json(app.store.requirement_baselines().map_err(unavailable)?).into_response())
 }
 #[derive(Deserialize)]
-#[serde(rename_all="camelCase", deny_unknown_fields)]
-struct RequirementInput { id:String, name:String, expected_sha256:String, enabled:bool }
-async fn save_requirement(State(app):State<Arc<App>>, headers:HeaderMap, Json(body):Json<RequirementInput>) -> ApiResult {
-    mutation(&app,&headers)?;
-    let item=RequirementBaseline{id:body.id,name:body.name,expected_sha256:body.expected_sha256,enabled:body.enabled};
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RequirementInput {
+    id: String,
+    name: String,
+    expected_sha256: String,
+    enabled: bool,
+}
+async fn save_requirement(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Json(body): Json<RequirementInput>,
+) -> ApiResult {
+    mutation(&app, &headers)?;
+    let item = RequirementBaseline {
+        id: body.id,
+        name: body.name,
+        expected_sha256: body.expected_sha256,
+        enabled: body.enabled,
+    };
     app.store.save_requirement_baseline(&item).map_err(bad)?;
     Ok(Json(item).into_response())
 }
-async fn remove_requirement(State(app):State<Arc<App>>, headers:HeaderMap, Path(id):Path<String>) -> ApiResult {
-    mutation(&app,&headers)?;
-    app.store.remove_requirement_baseline(&id).map_err(unavailable)?;
+async fn remove_requirement(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> ApiResult {
+    mutation(&app, &headers)?;
+    app.store
+        .remove_requirement_baseline(&id)
+        .map_err(unavailable)?;
     Ok(Json(json!({"ok":true})).into_response())
 }
 fn valid_id(id: &str) -> bool {
@@ -474,27 +637,66 @@ async fn request_result(
     )
     .await
 }
-async fn report_theme(State(app):State<Arc<App>>, headers:HeaderMap) -> ApiResult {
-    admin(&app,&headers)?;
-    let text=crate::pdf::dashboard_theme_json().map_err(|e|bad(e.0))?;
-    Ok(([(header::CONTENT_TYPE,"application/json")],text).into_response())
+async fn report_theme(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult {
+    admin(&app, &headers)?;
+    let text = crate::pdf::dashboard_theme_json().map_err(|e| bad(e.0))?;
+    Ok(([(header::CONTENT_TYPE, "application/json")], text).into_response())
 }
-async fn update_report_theme(State(app):State<Arc<App>>, headers:HeaderMap, Json(body):Json<Value>) -> ApiResult {
-    mutation(&app,&headers)?;
-    let text=crate::pdf::dashboard_update_theme(&body.to_string()).map_err(|e|bad(e.0))?;
-    Ok(([(header::CONTENT_TYPE,"application/json")],text).into_response())
+async fn update_report_theme(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> ApiResult {
+    mutation(&app, &headers)?;
+    let text = crate::pdf::dashboard_update_theme(&body.to_string()).map_err(|e| bad(e.0))?;
+    Ok(([(header::CONTENT_TYPE, "application/json")], text).into_response())
 }
-async fn request_pdf(State(app):State<Arc<App>>, headers:HeaderMap, Path(id):Path<String>) -> ApiResult {
-    let r=record(&app,&headers,&id)?;
-    let _permit=app.connections.try_acquire().map_err(|_|ApiError(StatusCode::SERVICE_UNAVAILABLE,"SERVER_BUSY".into()))?;
-    let reply=remote::request(app.store.signing_key().map_err(bad)?,r.client.clone(),"GET",format!("/v1/audit-requests/{id}/result"),None).await.map_err(unavailable)?;
-    validate_reply(&reply,&id,&r.client.id,true).map_err(unavailable)?;
-    if reply.code!=200 {
-        return Ok((StatusCode::from_u16(reply.code).map_err(|_|unavailable("invalid remote status"))?,Json(reply.body)).into_response());
+async fn request_pdf(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> ApiResult {
+    let r = record(&app, &headers, &id)?;
+    let _permit = app
+        .connections
+        .try_acquire()
+        .map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "SERVER_BUSY".into()))?;
+    let reply = remote::request(
+        app.store.signing_key().map_err(bad)?,
+        r.client.clone(),
+        "GET",
+        format!("/v1/audit-requests/{id}/result"),
+        None,
+    )
+    .await
+    .map_err(unavailable)?;
+    validate_reply(&reply, &id, &r.client.id, true).map_err(unavailable)?;
+    if reply.code != 200 {
+        return Ok((
+            StatusCode::from_u16(reply.code).map_err(|_| unavailable("invalid remote status"))?,
+            Json(reply.body),
+        )
+            .into_response());
     }
-    let report=crate::report_integrity::parse(&reply.body["report"]).map_err(unavailable)?;
-    let bytes=tokio::task::spawn_blocking(move||crate::pdf::render_received(&report)).await.map_err(|_|unavailable("PDF_RENDER_FAILED"))?.map_err(bad)?;
-    Ok(([(header::CONTENT_TYPE,"application/pdf"),(header::CONTENT_DISPOSITION,"inline; filename=baradwatchu-client-audit.pdf")],bytes).into_response())
+    let report = crate::report_integrity::parse(&reply.body["report"]).map_err(unavailable)?;
+    app.store
+        .remember_report(&r.operator_id, &id, &r.client, &reply.body["report"])
+        .map_err(unavailable)?;
+    let bytes = tokio::task::spawn_blocking(move || crate::pdf::render_received(&report))
+        .await
+        .map_err(|_| unavailable("PDF_RENDER_FAILED"))?
+        .map_err(bad)?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/pdf"),
+            (
+                header::CONTENT_DISPOSITION,
+                "inline; filename=baradwatchu-client-audit.pdf",
+            ),
+        ],
+        bytes,
+    )
+        .into_response())
 }
 async fn forward(
     app: &App,
@@ -520,13 +722,11 @@ async fn forward(
     .map_err(unavailable)?;
     validate_reply(&reply, id, &r.client.id, result).map_err(unavailable)?;
     if result && reply.code == 200 {
-        let baselines = app.store.requirement_baselines().map_err(unavailable)?;
         let report = crate::report_integrity::parse(&reply.body["report"]).map_err(unavailable)?;
-        reply.body["serverRequirementComparison"] = crate::report_integrity::inspect(&report, &baselines);
-        if let Some(manifest)=app.store.expected_manifest().map_err(unavailable)? {
-            reply.body["serverRequirementComparison"]["manifest"]=crate::manifest::compare(&manifest,&report).map_err(unavailable)?;
-        }
-        reply.body["serverRequirementComparison"]["definitions"] = Json(app.store.requirement_definitions().map_err(unavailable)?.iter().map(|d|d.compare(&report)).collect::<Vec<_>>()).0.into();
+        app.store
+            .remember_report(&r.operator_id, id, &r.client, &reply.body["report"])
+            .map_err(unavailable)?;
+        reply.body["serverRequirementComparison"] = comparison(app, &report)?;
     }
     Ok((
         StatusCode::from_u16(reply.code).map_err(|_| unavailable("invalid remote HTTP status"))?,
@@ -592,68 +792,364 @@ mod tests {
         );
     }
     #[tokio::test]
+    async fn history_api_is_private_and_delete_requires_csrf() {
+        let state = local_app();
+        let routes = application(state.clone());
+        let client = TrustedClient {
+            id: "BWU-test".into(),
+            name: "Test".into(),
+            endpoint: "127.0.0.1:7443".into(),
+            public_key: "key".into(),
+            fingerprint: "SHA256:test".into(),
+        };
+        let value = json!({"schemaVersion":"baradwatchu.audit.v1","completedAtUnixMs":123,"results":[],"extra":"preserved"});
+        state
+            .store
+            .remember_report("LOCAL", "ours", &client, &value)
+            .unwrap();
+        state
+            .store
+            .remember_report("other", "theirs", &client, &value)
+            .unwrap();
+        for path in [
+            "/api/history",
+            "/api/history/usage",
+            "/api/history/ours",
+            "/api/history/ours/pdf",
+        ] {
+            let response = routes
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        let response = routes
+            .clone()
+            .oneshot(session_request(&state))
+            .await
+            .unwrap();
+        let cookie = response.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let session: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        let response = routes
+            .clone()
+            .oneshot(
+                Request::get("/api/history/theirs")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let response = routes
+            .clone()
+            .oneshot(
+                Request::get("/api/history/ours")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let saved: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+        assert_eq!(saved["report"], value);
+        let response = routes
+            .clone()
+            .oneshot(
+                Request::delete("/api/history")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let response = routes
+            .oneshot(
+                Request::delete("/api/history")
+                    .header(header::COOKIE, cookie)
+                    .header(header::ORIGIN, "http://localhost:3000")
+                    .header("x-bwu-csrf", session["csrf"].as_str().unwrap())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(state.store.history("LOCAL").unwrap().is_empty());
+        assert_eq!(state.store.history("other").unwrap().len(), 1);
+    }
+    #[tokio::test]
     async fn manifest_api_requires_authorization_csrf_and_explicit_provisioning() {
-        for state in [app(),local_app()] {
-            let routes=application(state.clone());
-            for method in ["GET","DELETE"] {
-                let response=routes.clone().oneshot(Request::builder().method(method).uri("/api/expected-manifest").body(Body::empty()).unwrap()).await.unwrap();
-                assert_eq!(response.status(),StatusCode::UNAUTHORIZED);
+        for state in [app(), local_app()] {
+            let routes = application(state.clone());
+            for method in ["GET", "DELETE"] {
+                let response = routes
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method(method)
+                            .uri("/api/expected-manifest")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
             }
             assert!(state.store.expected_manifest().unwrap().is_none());
         }
-        let state=local_app();let routes=application(state.clone());
-        let response=routes.clone().oneshot(Request::get("/api/session").body(Body::empty()).unwrap()).await.unwrap();
-        let cookie=response.headers()[header::SET_COOKIE].to_str().unwrap().split(';').next().unwrap().to_owned();
-        let session:Value=serde_json::from_slice(&to_bytes(response.into_body(),4096).await.unwrap()).unwrap();
-        let text=include_str!("../tests/fixtures/client-builtin-tools.sha256");
-        let body=json!({"text":text}).to_string();
-        let response=routes.clone().oneshot(Request::put("/api/expected-manifest").header(header::COOKIE,&cookie).header(header::CONTENT_TYPE,"application/json").body(Body::from(body.clone())).unwrap()).await.unwrap();
-        assert_eq!(response.status(),StatusCode::FORBIDDEN);
+        let state = local_app();
+        let routes = application(state.clone());
+        let response = routes
+            .clone()
+            .oneshot(session_request(&state))
+            .await
+            .unwrap();
+        let cookie = response.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let session: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        let text = include_str!("../tests/fixtures/client-builtin-tools.sha256");
+        let body = json!({"text":text}).to_string();
+        let response = routes
+            .clone()
+            .oneshot(
+                Request::put("/api/expected-manifest")
+                    .header(header::COOKIE, &cookie)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert!(state.store.expected_manifest().unwrap().is_none());
-        let response=routes.oneshot(Request::put("/api/expected-manifest").header(header::COOKIE,cookie).header(header::ORIGIN,"http://localhost:3000").header("x-bwu-csrf",session["csrf"].as_str().unwrap()).header(header::CONTENT_TYPE,"application/json").body(Body::from(body)).unwrap()).await.unwrap();
-        assert_eq!(response.status(),StatusCode::OK);
-        assert_eq!(state.store.expected_manifest().unwrap().as_deref(),Some(text));
+        let response = routes
+            .oneshot(
+                Request::put("/api/expected-manifest")
+                    .header(header::COOKIE, cookie)
+                    .header(header::ORIGIN, "http://localhost:3000")
+                    .header("x-bwu-csrf", session["csrf"].as_str().unwrap())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            state.store.expected_manifest().unwrap().as_deref(),
+            Some(text)
+        );
     }
     #[tokio::test]
     async fn requirement_definition_routes_require_authorization_and_csrf() {
-        for state in [app(),local_app()] {
-            let routes=application(state);
-            let response=routes.clone().oneshot(Request::get("/api/requirement-definitions").body(Body::empty()).unwrap()).await.unwrap();
-            assert_eq!(response.status(),StatusCode::UNAUTHORIZED);
-            let response=routes.clone().oneshot(Request::delete("/api/requirement-definitions/CUSTOM-001").body(Body::empty()).unwrap()).await.unwrap();
-            assert_eq!(response.status(),StatusCode::UNAUTHORIZED);
+        for state in [app(), local_app()] {
+            let routes = application(state);
+            let response = routes
+                .clone()
+                .oneshot(
+                    Request::get("/api/requirement-definitions")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            let response = routes
+                .clone()
+                .oneshot(
+                    Request::delete("/api/requirement-definitions/CUSTOM-001")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         }
-        let state=local_app();let routes=application(state.clone());
-        let response=routes.clone().oneshot(Request::get("/api/session").body(Body::empty()).unwrap()).await.unwrap();
-        let cookie=response.headers()[header::SET_COOKIE].to_str().unwrap().split(';').next().unwrap().to_owned();
-        let session:Value=serde_json::from_slice(&to_bytes(response.into_body(),4096).await.unwrap()).unwrap();
-        let body=r#"{"schemaVersion":"baradwatchu.custom-checks.v1","id":"CUSTOM-001","name":"Test","description":"","enabled":false,"priority":"HIGH","overrideBuiltinId":"REQ-001"}"#;
-        let response=routes.clone().oneshot(Request::post("/api/requirement-definitions").header(header::COOKIE,&cookie).header(header::CONTENT_TYPE,"application/json").body(Body::from(body)).unwrap()).await.unwrap();
-        assert_eq!(response.status(),StatusCode::FORBIDDEN);
+        let state = local_app();
+        let routes = application(state.clone());
+        let response = routes
+            .clone()
+            .oneshot(session_request(&state))
+            .await
+            .unwrap();
+        let cookie = response.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let session: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        let body = r#"{"schemaVersion":"baradwatchu.custom-checks.v1","id":"CUSTOM-001","name":"Test","description":"","enabled":false,"priority":"HIGH","overrideBuiltinId":"REQ-001"}"#;
+        let response = routes
+            .clone()
+            .oneshot(
+                Request::post("/api/requirement-definitions")
+                    .header(header::COOKIE, &cookie)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert!(state.store.requirement_definitions().unwrap().is_empty());
-        let response=routes.clone().oneshot(Request::post("/api/requirement-definitions").header(header::COOKIE,&cookie).header(header::ORIGIN,"http://localhost:3000").header("x-bwu-csrf",session["csrf"].as_str().unwrap()).header(header::CONTENT_TYPE,"application/json").body(Body::from(body)).unwrap()).await.unwrap();
-        assert_eq!(response.status(),StatusCode::OK);
-        assert_eq!(state.store.requirement_definitions().unwrap()[0].override_builtin_id.as_deref(),Some("REQ-001"));
+        let response = routes
+            .clone()
+            .oneshot(
+                Request::post("/api/requirement-definitions")
+                    .header(header::COOKIE, &cookie)
+                    .header(header::ORIGIN, "http://localhost:3000")
+                    .header("x-bwu-csrf", session["csrf"].as_str().unwrap())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            state.store.requirement_definitions().unwrap()[0]
+                .override_builtin_id
+                .as_deref(),
+            Some("REQ-001")
+        );
+    }
+    #[tokio::test]
+    async fn local_logout_revokes_token_and_next_session_rotates_it() {
+        let state = local_app();
+        let routes = application(state.clone());
+        let first = routes
+            .clone()
+            .oneshot(session_request(&state))
+            .await
+            .unwrap();
+        let first_cookie = first.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let first_value: Value =
+            serde_json::from_slice(&to_bytes(first.into_body(), 4096).await.unwrap()).unwrap();
+        let logout = routes
+            .clone()
+            .oneshot(
+                Request::post("/auth/logout")
+                    .header(header::COOKIE, &first_cookie)
+                    .header(header::ORIGIN, "http://localhost:3000")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-bwu-csrf", first_value["csrf"].as_str().unwrap())
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(logout.status(), StatusCode::OK);
+        let stale = routes
+            .clone()
+            .oneshot(
+                Request::get("/api/clients")
+                    .header(header::COOKIE, &first_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::UNAUTHORIZED);
+        let second = routes.oneshot(session_request(&state)).await.unwrap();
+        let second_cookie = second.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap();
+        assert_ne!(first_cookie, second_cookie);
+        let second_value: Value =
+            serde_json::from_slice(&to_bytes(second.into_body(), 4096).await.unwrap()).unwrap();
+        assert_ne!(first_value["csrf"], second_value["csrf"]);
     }
     #[tokio::test]
     async fn language_settings_require_authorization_and_csrf() {
         for state in [app(), local_app()] {
-            let routes=application(state);
-            let response=routes.clone().oneshot(Request::get("/api/configuration/language").body(Body::empty()).unwrap()).await.unwrap();
-            assert_eq!(response.status(),StatusCode::UNAUTHORIZED);
-            let response=routes.clone().oneshot(Request::put("/api/configuration/language").header(header::CONTENT_TYPE,"application/json").body(Body::from(r#"{"language":"english"}"#)).unwrap()).await.unwrap();
-            assert_eq!(response.status(),StatusCode::UNAUTHORIZED);
-            let catalog=routes.oneshot(Request::get("/api/messages").body(Body::empty()).unwrap()).await.unwrap();
-            assert_eq!(catalog.status(),StatusCode::OK);
-            let catalog:Value=serde_json::from_slice(&to_bytes(catalog.into_body(),65536).await.unwrap()).unwrap();
+            let routes = application(state);
+            let response = routes
+                .clone()
+                .oneshot(
+                    Request::get("/api/configuration/language")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            let response = routes
+                .clone()
+                .oneshot(
+                    Request::put("/api/configuration/language")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(r#"{"language":"english"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            let catalog = routes
+                .oneshot(Request::get("/api/messages").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(catalog.status(), StatusCode::OK);
+            let catalog: Value =
+                serde_json::from_slice(&to_bytes(catalog.into_body(), 65536).await.unwrap())
+                    .unwrap();
             assert!(catalog["messages"]["server.settings"].is_string());
             assert!(catalog.get("operator").is_none());
         }
-        let routes=application(local_app());
-        let response=routes.clone().oneshot(Request::get("/api/session").body(Body::empty()).unwrap()).await.unwrap();
-        let cookie=response.headers()[header::SET_COOKIE].to_str().unwrap().split(';').next().unwrap().to_owned();
-        let response=routes.oneshot(Request::put("/api/configuration/language").header(header::COOKIE,cookie).header(header::CONTENT_TYPE,"application/json").body(Body::from(r#"{"language":"english"}"#)).unwrap()).await.unwrap();
-        assert_eq!(response.status(),StatusCode::FORBIDDEN);
+        let state = local_app();
+        let routes = application(state.clone());
+        let response = routes
+            .clone()
+            .oneshot(session_request(&state))
+            .await
+            .unwrap();
+        let cookie = response.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let response = routes
+            .oneshot(
+                Request::put("/api/configuration/language")
+                    .header(header::COOKIE, cookie)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"language":"english"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
     #[tokio::test]
     async fn health_returns_the_bootstrap_contract() {
@@ -684,6 +1180,13 @@ mod tests {
         )
         .unwrap()
     }
+    fn session_request(app: &App) -> Request<Body> {
+        let mut request = Request::get("/api/session");
+        if let Some(token) = app.launch_token() {
+            request = request.header("x-baradwatchu-token", token);
+        }
+        request.body(Body::empty()).unwrap()
+    }
     fn local_app() -> Arc<App> {
         App::new(
             Store::memory(),
@@ -698,6 +1201,93 @@ mod tests {
         .unwrap()
     }
     #[tokio::test]
+    async fn local_session_requires_launch_token_and_loopback_host() {
+        let app = App::with_listen_address(
+            Store::memory(),
+            local_app().settings.clone(),
+            Some("127.0.0.1:3000".parse().unwrap()),
+        )
+        .unwrap();
+        let token = app.launch_token().unwrap().to_owned();
+        assert_eq!(token.len(), 64);
+        let router = application(app.clone());
+        let status = |request: Request<Body>| {
+            let router = router.clone();
+            async move { router.oneshot(request).await.unwrap().status() }
+        };
+        let get = || Request::get("/api/session");
+        assert_eq!(
+            status(get().body(Body::empty()).unwrap()).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            status(
+                get()
+                    .header("x-baradwatchu-token", "0".repeat(64))
+                    .body(Body::empty())
+                    .unwrap()
+            )
+            .await,
+            StatusCode::UNAUTHORIZED
+        );
+        for host in ["attacker.example:3000", "localhost:4000", "127.0.0.2:3000"] {
+            assert_eq!(
+                status(
+                    get()
+                        .header(header::HOST, host)
+                        .header("x-baradwatchu-token", &token)
+                        .body(Body::empty())
+                        .unwrap()
+                )
+                .await,
+                StatusCode::MISDIRECTED_REQUEST,
+                "{host}"
+            );
+        }
+        assert_eq!(
+            status(
+                Request::get("/")
+                    .header(header::HOST, "attacker.example")
+                    .body(Body::empty())
+                    .unwrap()
+            )
+            .await,
+            StatusCode::MISDIRECTED_REQUEST
+        );
+        for host in [
+            "localhost:3000",
+            "127.0.0.1:3000",
+            "[::1]:3000",
+            "LOCALHOST:3000",
+        ] {
+            assert_eq!(
+                status(
+                    get()
+                        .header(header::HOST, host)
+                        .header("x-baradwatchu-token", &token)
+                        .body(Body::empty())
+                        .unwrap()
+                )
+                .await,
+                StatusCode::OK,
+                "{host}"
+            );
+        }
+        // OIDC never has a launch token and keeps reverse-proxy Host values.
+        let oidc = super::tests::app();
+        assert!(oidc.launch_token().is_none());
+        let response = application(oidc)
+            .oneshot(
+                Request::get("/api/auth-mode")
+                    .header(header::HOST, "server.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    #[tokio::test]
     async fn local_session_unlocks_shared_protected_api_and_disables_oidc_routes() {
         let app = local_app();
         let router = application(app.clone());
@@ -709,11 +1299,7 @@ mod tests {
         let mode: Value =
             serde_json::from_slice(&to_bytes(mode.into_body(), 1024).await.unwrap()).unwrap();
         assert_eq!(mode["mode"], "LOCAL");
-        let response = router
-            .clone()
-            .oneshot(Request::get("/api/session").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
+        let response = router.clone().oneshot(session_request(&app)).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let cookie = response.headers()[header::SET_COOKIE]
             .to_str()
@@ -831,11 +1417,7 @@ mod tests {
     async fn oidc_mode_has_no_local_session_or_local_auth_bypass() {
         let app = app();
         let router = application(app.clone());
-        let session = router
-            .clone()
-            .oneshot(Request::get("/api/session").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
+        let session = router.clone().oneshot(session_request(&app)).await.unwrap();
         assert_eq!(session.status(), StatusCode::UNAUTHORIZED);
         assert!(session.headers().get(header::SET_COOKIE).is_none());
         let mode = router
@@ -852,7 +1434,11 @@ async fn language(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult 
     admin(&app, &headers)?;
     Ok(Json(crate::preferences::language_view()).into_response())
 }
-async fn update_language(State(app): State<Arc<App>>, headers: HeaderMap, Json(body): Json<crate::preferences::LanguageRequest>) -> ApiResult {
+async fn update_language(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Json(body): Json<crate::preferences::LanguageRequest>,
+) -> ApiResult {
     mutation(&app, &headers)?;
     Ok(Json(crate::preferences::save_language(body).map_err(|e| bad(e.0))?).into_response())
 }
@@ -862,35 +1448,159 @@ async fn messages() -> Json<Value> {
     Json(crate::preferences::language_view())
 }
 
-async fn requirement_definitions(State(app):State<Arc<App>>,headers:HeaderMap)->ApiResult {
-    admin(&app,&headers)?;
+async fn requirement_definitions(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult {
+    admin(&app, &headers)?;
     Ok(Json(app.store.requirement_definitions().map_err(unavailable)?).into_response())
 }
-async fn save_requirement_definition(State(app):State<Arc<App>>,headers:HeaderMap,Json(body):Json<crate::requirement_config::CheckConfiguration>)->ApiResult {
-    mutation(&app,&headers)?;
+async fn save_requirement_definition(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Json(body): Json<crate::requirement_config::CheckConfiguration>,
+) -> ApiResult {
+    mutation(&app, &headers)?;
     app.store.save_requirement_definition(&body).map_err(bad)?;
     Ok(Json(body).into_response())
 }
-async fn remove_requirement_definition(State(app):State<Arc<App>>,headers:HeaderMap,Path(id):Path<String>)->ApiResult {
-    mutation(&app,&headers)?;
-    app.store.remove_requirement_definition(&id).map_err(unavailable)?;
+async fn remove_requirement_definition(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> ApiResult {
+    mutation(&app, &headers)?;
+    app.store
+        .remove_requirement_definition(&id)
+        .map_err(unavailable)?;
     Ok(Json(json!({"ok":true})).into_response())
 }
 
-async fn expected_manifest(State(app):State<Arc<App>>,headers:HeaderMap)->ApiResult {
-    admin(&app,&headers)?;
-    Ok(Json(crate::manifest::view(app.store.expected_manifest().map_err(unavailable)?.as_deref()).map_err(unavailable)?).into_response())
+async fn expected_manifest(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult {
+    admin(&app, &headers)?;
+    Ok(Json(
+        crate::manifest::view(
+            app.store
+                .expected_manifest()
+                .map_err(unavailable)?
+                .as_deref(),
+        )
+        .map_err(unavailable)?,
+    )
+    .into_response())
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ManifestInput {text:String}
-async fn save_expected_manifest(State(app):State<Arc<App>>,headers:HeaderMap,Json(body):Json<ManifestInput>)->ApiResult {
-    mutation(&app,&headers)?;
+struct ManifestInput {
+    text: String,
+}
+async fn save_expected_manifest(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Json(body): Json<ManifestInput>,
+) -> ApiResult {
+    mutation(&app, &headers)?;
     app.store.save_expected_manifest(&body.text).map_err(bad)?;
     Ok(Json(crate::manifest::view(Some(&body.text)).map_err(bad)?).into_response())
 }
-async fn remove_expected_manifest(State(app):State<Arc<App>>,headers:HeaderMap)->ApiResult {
-    mutation(&app,&headers)?;
+async fn remove_expected_manifest(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult {
+    mutation(&app, &headers)?;
     app.store.remove_expected_manifest().map_err(unavailable)?;
     Ok(Json(json!({"ok":true})).into_response())
+}
+
+fn comparison(app: &App, report: &crate::report::AuditReport) -> Result<Value, ApiError> {
+    let mut result = crate::report_integrity::inspect(
+        report,
+        &app.store.requirement_baselines().map_err(unavailable)?,
+    );
+    if let Some(manifest) = app.store.expected_manifest().map_err(unavailable)? {
+        result["manifest"] = crate::manifest::compare(&manifest, report).map_err(unavailable)?;
+    }
+    result["definitions"] = json!(app
+        .store
+        .requirement_definitions()
+        .map_err(unavailable)?
+        .iter()
+        .map(|d| d.compare(report))
+        .collect::<Vec<_>>());
+    Ok(result)
+}
+async fn history(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult {
+    let s = admin(&app, &headers)?;
+    Ok(Json(app.store.history(&s.operator.id).map_err(unavailable)?).into_response())
+}
+async fn history_usage(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult {
+    let s = admin(&app, &headers)?;
+    Ok(Json(
+        app.store
+            .history_usage(&s.operator.id)
+            .map_err(unavailable)?,
+    )
+    .into_response())
+}
+fn saved_report(app: &App, headers: &HeaderMap, id: &str) -> Result<Value, ApiError> {
+    let s = admin(app, headers)?;
+    app.store
+        .history_report(&s.operator.id, id)
+        .map_err(unavailable)?
+        .ok_or(ApiError(StatusCode::NOT_FOUND, "REPORT_NOT_FOUND".into()))
+}
+async fn history_report(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> ApiResult {
+    let report = saved_report(&app, &headers, &id)?;
+    let parsed = crate::report_integrity::parse(&report).map_err(unavailable)?;
+    Ok(
+        Json(json!({"report":report,"serverRequirementComparison":comparison(&app,&parsed)?}))
+            .into_response(),
+    )
+}
+async fn history_pdf(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> ApiResult {
+    let value = saved_report(&app, &headers, &id)?;
+    let report = crate::report_integrity::parse(&value).map_err(unavailable)?;
+    let _permit = app
+        .connections
+        .try_acquire()
+        .map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "SERVER_BUSY".into()))?;
+    let bytes = tokio::task::spawn_blocking(move || crate::pdf::render_received(&report))
+        .await
+        .map_err(|_| unavailable("PDF_RENDER_FAILED"))?
+        .map_err(bad)?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/pdf"),
+            (
+                header::CONTENT_DISPOSITION,
+                "inline; filename=baradwatchu-client-audit.pdf",
+            ),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+async fn delete_history(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> ApiResult {
+    let s = mutation(&app, &headers)?;
+    Ok(Json(
+        app.store
+            .remove_history(&s.operator.id, Some(&id))
+            .map_err(unavailable)?,
+    )
+    .into_response())
+}
+async fn clear_history(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult {
+    let s = mutation(&app, &headers)?;
+    Ok(Json(
+        app.store
+            .remove_history(&s.operator.id, None)
+            .map_err(unavailable)?,
+    )
+    .into_response())
 }

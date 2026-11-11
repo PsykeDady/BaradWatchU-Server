@@ -268,10 +268,18 @@ pub struct Settings {
     #[serde(default)]
     pub web_dir: Option<std::path::PathBuf>,
 }
-fn default_public_url() -> String { "http://localhost:3000".into() }
+fn default_public_url() -> String {
+    "http://localhost:3000".into()
+}
 impl Default for Settings {
     fn default() -> Self {
-        Self { auth_mode: AuthMode::Local, public_url: default_public_url(), google: None, local_operator_name: None, web_dir: None }
+        Self {
+            auth_mode: AuthMode::Local,
+            public_url: default_public_url(),
+            google: None,
+            local_operator_name: None,
+            web_dir: None,
+        }
     }
 }
 impl Settings {

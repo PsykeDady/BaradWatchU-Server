@@ -855,10 +855,15 @@ mod tests {
 }
 
 /// Server labels use the same JSON catalog and effective language as Client/PDF.
-pub fn server_dashboard_catalog(language: Language) -> std::collections::BTreeMap<&'static str, &'static str> {
-    locale_catalog(language).messages.iter()
+pub fn server_dashboard_catalog(
+    language: Language,
+) -> std::collections::BTreeMap<&'static str, &'static str> {
+    locale_catalog(language)
+        .messages
+        .iter()
         .filter(|(key, _)| key.starts_with("server."))
-        .map(|(key, value)| (key.as_str(), value.as_str())).collect()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect()
 }
 
 #[cfg(test)]
@@ -866,15 +871,20 @@ mod server_catalog_tests {
     use super::*;
     #[test]
     fn server_catalogs_have_matching_nonempty_keys() {
-        let it=server_dashboard_catalog(Language::Italian);
-        let en=server_dashboard_catalog(Language::English);
-        assert_eq!(it.keys().collect::<Vec<_>>(),en.keys().collect::<Vec<_>>());
-        assert!(it.len()>90);
-        for (key,value) in it.iter().chain(en.iter()) {
-            assert!(!value.trim().is_empty(),"{key}");
+        let it = server_dashboard_catalog(Language::Italian);
+        let en = server_dashboard_catalog(Language::English);
+        assert_eq!(it.keys().collect::<Vec<_>>(), en.keys().collect::<Vec<_>>());
+        assert!(it.len() > 90);
+        for (key, value) in it.iter().chain(en.iter()) {
+            assert!(!value.trim().is_empty(), "{key}");
         }
-        for key in ["server.requestState.EXPIRED","server.error.RESULT_EXPIRED","server.confirmIdentity","server.issue.FILE_STATE_HASH_CONTRADICTION"] {
-            assert!(it.contains_key(key),"{key}");
+        for key in [
+            "server.requestState.EXPIRED",
+            "server.error.RESULT_EXPIRED",
+            "server.confirmIdentity",
+            "server.issue.FILE_STATE_HASH_CONTRADICTION",
+        ] {
+            assert!(it.contains_key(key), "{key}");
         }
     }
 }

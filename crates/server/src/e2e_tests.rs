@@ -49,6 +49,58 @@ async fn call(
         .unwrap();
     (code, serde_json::from_slice(&bytes).unwrap())
 }
+async fn verify_history_pdf(
+    router: &Router,
+    id: &str,
+    cookie: &str,
+    csrf: &str,
+    report: &Value,
+    client_pdf: &[u8],
+) {
+    let (code, history) = call(router, "/api/history", "GET", cookie, csrf, Value::Null).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(history.as_array().unwrap().len(), 1);
+    assert_eq!(history[0]["id"], id);
+    let (code, saved) = call(
+        router,
+        &format!("/api/history/{id}"),
+        "GET",
+        cookie,
+        csrf,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(&saved["report"], report);
+    let response = router
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/history/{id}/pdf"))
+                .header(header::COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "application/pdf");
+    let pdf = to_bytes(response.into_body(), 16 * 1024 * 1024)
+        .await
+        .unwrap();
+    assert!(pdf.starts_with(b"%PDF-1.7"));
+    assert_eq!(
+        pdf.as_ref(),
+        client_pdf,
+        "Server and Client rendering of the received report must match with the same language/theme"
+    );
+    if let Ok(directory) = std::env::var("BWU_E2E_ARTIFACT_DIR") {
+        std::fs::write(
+            std::path::Path::new(&directory).join(format!("{id}.pdf")),
+            &pdf,
+        )
+        .unwrap();
+    }
+}
 async fn login(router: &Router, mock: &MockOidc, sub: &str, name: &str) -> (String, String) {
     let response = router
         .clone()
@@ -188,6 +240,33 @@ async fn local_mode_operator_name_reaches_consent_and_audit_report() {
     assert_eq!(cached["initiator"], result["report"]["initiator"]);
     let pdf = std::fs::read(result["report"]["pdf"]["path"].as_str().unwrap()).unwrap();
     assert!(String::from_utf8_lossy(&pdf).contains("Mario Rossi locale"));
+    // Stop all fixture Client processes: saved history/PDF must work without remote access.
+    drop(client);
+    verify_history_pdf(&router, id, &cookie, &session.csrf, &result["report"], &pdf).await;
+    let (code, removed) = call(
+        &router,
+        &format!("/api/history/{id}"),
+        "DELETE",
+        &cookie,
+        &session.csrf,
+        json!({}),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(removed["removedAudits"], 1);
+    assert_eq!(
+        call(
+            &router,
+            &format!("/api/history/{id}"),
+            "GET",
+            &cookie,
+            &session.csrf,
+            Value::Null
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -328,7 +407,33 @@ async fn two_oidc_admins_request_real_client_audits_with_named_consent() {
         assert_eq!(cached["initiator"], result["report"]["initiator"]);
         let pdf = std::fs::read(result["report"]["pdf"]["path"].as_str().unwrap()).unwrap();
         assert!(String::from_utf8_lossy(&pdf).contains(name));
+        verify_history_pdf(&router, &id, &cookie, &csrf, &result["report"], &pdf).await;
+        let other_id = if sub == "operator-one" {
+            "server-mvp-operator-two"
+        } else {
+            "server-mvp-operator-one"
+        };
+        assert_eq!(
+            call(
+                &router,
+                &format!("/api/history/{other_id}"),
+                "GET",
+                &cookie,
+                &csrf,
+                Value::Null
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+
         app.store.revoke(sub).unwrap();
+        assert_eq!(
+            call(&router, "/api/history", "GET", &cookie, &csrf, Value::Null)
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
         assert_eq!(
             call(&router, "/api/clients", "GET", &cookie, &csrf, Value::Null)
                 .await

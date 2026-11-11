@@ -19,6 +19,9 @@ mod e2e_tests;
 pub mod report;
 pub mod report_integrity;
 
+pub mod launcher;
+// Client PDF snapshot keeps the Client's MSRV-1.80 `map_or(true, ..)` spelling for parity.
+#[allow(clippy::unnecessary_map_or)]
 mod pdf;
 mod preferences;
 

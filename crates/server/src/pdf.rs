@@ -1,10 +1,7 @@
 //! Client PDF renderer snapshot (template 1.3.0), adapted only at its input/output boundary.
 //! Renders received audit data; does not execute checks or rewrite the source report.
 use crate::preferences::{self as req, CliError};
-use crate::report::{
-    AuditReport, DisabledRequirement, ProviderResult, ResultRecord,
-    ResultStatus,
-};
+use crate::report::{AuditReport, DisabledRequirement, ProviderResult, ResultRecord, ResultStatus};
 use flate2::{write::ZlibEncoder, Compression};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -348,7 +345,10 @@ pub(crate) fn dashboard_update_theme(text: &str) -> Result<String, CliError> {
 pub(crate) fn render_received(report: &AuditReport) -> Result<Vec<u8>, String> {
     let theme = read_theme()?;
     let _warning = theme_warning(&theme)?;
-    let theme_hash = format!("{:x}", Sha256::digest(serde_json::to_vec(&theme).map_err(|e| e.to_string())?));
+    let theme_hash = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&theme).map_err(|e| e.to_string())?)
+    );
     let logo = theme.logo_path.as_deref().map(load_logo).transpose()?;
     render_pdf(report, &theme, &theme_hash, logo.as_ref())
 }
@@ -648,6 +648,15 @@ fn render_pdf(
 }
 
 #[allow(clippy::too_many_arguments)] // Renderer state is explicit to keep PDF output deterministic.
+fn report_subtitle_key(report: &AuditReport) -> &'static str {
+    match &report.initiator {
+        Some(crate::report::AuditInitiator::Local) => "pdf.report_subtitle",
+        Some(crate::report::AuditInitiator::Remote { .. }) => "pdf.report_subtitle_remote",
+        None => "pdf.report_subtitle_unknown",
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // Header also carries the remote initiator; mirrors Client renderer state.
 fn draw_header(
     ops: &mut Vec<String>,
     cursor: &mut f32,
@@ -702,7 +711,7 @@ fn draw_header(
                 true,
                 [166, 60, 22],
                 baradwatchu_messages::message(
-                    "pdf.report_subtitle",
+                    report_subtitle_key(report),
                     baradwatchu_messages::configured_language(),
                 ),
             ));
@@ -1937,10 +1946,20 @@ fn encode_pdf(mut pages: Vec<Vec<String>>, logo: Option<&Logo>) -> Result<Vec<u8
         let smask = alpha_id
             .map(|id| format!(" /SMask {id} 0 R"))
             .unwrap_or_default();
-        objects[id] = stream_object(&format!("/Type /XObject /Subtype /Image /Width {width} /Height {height} /ColorSpace {color_space} /BitsPerComponent 8 /Filter {filter}{smask}"), &data);
+        objects[id] = stream_object(
+            &format!(
+                "/Type /XObject /Subtype /Image /Width {width} /Height {height} /ColorSpace {color_space} /BitsPerComponent 8 /Filter {filter}{smask}"
+            ),
+            &data,
+        );
         if let (Some(alpha), Some(id)) = (alpha_obj, alpha_id) {
             let (w, h, _) = logo_obj.unwrap();
-            objects[id] = stream_object(&format!("/Type /XObject /Subtype /Image /Width {w} /Height {h} /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode"), &alpha);
+            objects[id] = stream_object(
+                &format!(
+                    "/Type /XObject /Subtype /Image /Width {w} /Height {h} /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode"
+                ),
+                &alpha,
+            );
         }
     }
     for (page_index, ops) in pages.iter().enumerate() {
@@ -1989,13 +2008,25 @@ mod server_tests {
     use super::*;
     #[test]
     fn received_report_renders_original_client_and_remote_requester() {
-        let value=serde_json::json!({"schemaVersion":"baradwatchu.audit.v1","completedAtUnixMs":1700000000000u64,"client":{"version":"CLIENT-VERSION","sha256":"a".repeat(64)},"initiator":{"origin":"REMOTE","operatorDisplayName":"Mario Rossi","serverId":"SRV-TEST","serverDisplayName":"Office Server","serverTrustedName":"Trusted Server","serverFingerprint":"SHA256:test"},"results":[{"id":"REQ-001","name":"Updates","description":"Client observation","priority":"HIGH","status":"PASS","summary":"All updates installed","details":[],"completedAtUnixMs":1700000000000u64}]});
-        let report=crate::report_integrity::parse(&value).unwrap();
-        let bytes=render_pdf(&report,&ReportTheme::default(),"theme-sha",None).unwrap();
+        let value = serde_json::json!({"schemaVersion":"baradwatchu.audit.v1","completedAtUnixMs":1700000000000u64,"client":{"version":"CLIENT-VERSION","sha256":"a".repeat(64)},"initiator":{"origin":"REMOTE","operatorDisplayName":"Mario Rossi","serverId":"SRV-TEST","serverDisplayName":"Office Server","serverTrustedName":"Trusted Server","serverFingerprint":"SHA256:test"},"results":[{"id":"REQ-001","name":"Updates","description":"Client observation","priority":"HIGH","status":"PASS","summary":"All updates installed","details":[],"completedAtUnixMs":1700000000000u64}]});
+        let report = crate::report_integrity::parse(&value).unwrap();
+        assert_eq!(report_subtitle_key(&report), "pdf.report_subtitle_remote");
+        let bytes = render_pdf(&report, &ReportTheme::default(), "theme-sha", None).unwrap();
         assert!(bytes.starts_with(b"%PDF-1.7"));
-        let text=String::from_utf8_lossy(&bytes);
-        for expected in ["Mario Rossi","CLIENT-VERSION","REQ-001","Client observation","All updates installed","startxref"] {assert!(text.contains(expected),"missing {expected}");}
-        assert_eq!(serde_json::to_value(&report).unwrap()["client"],value["client"]);
+        let text = String::from_utf8_lossy(&bytes);
+        for expected in [
+            "Mario Rossi",
+            "CLIENT-VERSION",
+            "REQ-001",
+            "Client observation",
+            "All updates installed",
+            "startxref",
+        ] {
+            assert!(text.contains(expected), "missing {expected}");
+        }
+        assert_eq!(
+            serde_json::to_value(&report).unwrap()["client"],
+            value["client"]
+        );
     }
 }
-

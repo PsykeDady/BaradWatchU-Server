@@ -49,7 +49,8 @@ pub struct Auth {
     #[cfg(test)]
     pub(crate) mock_provider: Option<CoreProviderMetadata>,
     config: Option<OidcConfig>,
-    local_session: Option<(String, Session)>,
+    local_session: Mutex<Option<(String, Session)>>,
+    local_name: Option<String>,
     http: reqwest::Client,
     logins: Mutex<HashMap<String, Login>>,
     sessions: Mutex<HashMap<String, Session>>,
@@ -62,41 +63,68 @@ impl Auth {
             .https_only(true)
             .build()
             .map_err(|_| "OIDC HTTP initialization failed")?;
-        let mut sessions = HashMap::new();
-        let local_session = if config.is_none() {
-            let token = storage::random()?;
-            let csrf = storage::random()?;
-            let session = Session {
-                operator: OperatorIdentity {
-                    id: "LOCAL".into(),
-                    name: local_name.unwrap_or_else(process_operator_name),
-                    email: None,
-                    issuer: None,
-                    sub: None,
-                },
-                csrf,
-                expires: u64::MAX,
-            };
-            sessions.insert(token.clone(), session.clone());
-            Some((token, session))
+        let local_name = if config.is_none() {
+            Some(local_name.unwrap_or_else(process_operator_name))
         } else {
             None
         };
+        let local_session = Mutex::new(None);
         Ok(Self {
             #[cfg(test)]
             mock_provider: None,
             config,
             local_session,
+            local_name,
             http,
             logins: Mutex::new(HashMap::new()),
-            sessions: Mutex::new(sessions),
+            sessions: Mutex::new(HashMap::new()),
         })
     }
     pub fn is_local(&self) -> bool {
         self.config.is_none()
     }
-    pub fn local_session(&self) -> Option<(String, Session)> {
-        self.local_session.clone()
+    /// Create or reuse an eight-hour loopback session. LOCAL identity is descriptive, not OS authentication.
+    pub fn local_session(&self) -> Result<(String, Session)> {
+        let now = storage::now_ms();
+        let mut current = self.local_session.lock().unwrap();
+        if let Some(existing) = current
+            .as_ref()
+            .filter(|(_, session)| session.expires > now)
+        {
+            return Ok(existing.clone());
+        }
+        let token = storage::random()?;
+        let csrf = storage::random()?;
+        let session = Session {
+            operator: OperatorIdentity {
+                id: "LOCAL".into(),
+                name: self
+                    .local_name
+                    .clone()
+                    .unwrap_or_else(process_operator_name),
+                email: None,
+                issuer: None,
+                sub: None,
+            },
+            csrf,
+            expires: now + SESSION_MS,
+        };
+        let mut sessions = self.sessions.lock().unwrap();
+        sessions.retain(|_, v| v.expires > now);
+        if sessions.len() >= 1024 {
+            return Err("too many sessions".into());
+        }
+        sessions.insert(token.clone(), session.clone());
+        *current = Some((token.clone(), session.clone()));
+        Ok((token, session))
+    }
+    pub fn revoke_local_session(&self, token: &str) {
+        // Keep lock order identical to local_session() to avoid logout/session races.
+        let mut current = self.local_session.lock().unwrap();
+        self.sessions.lock().unwrap().remove(token);
+        if current.as_ref().is_some_and(|(active, _)| active == token) {
+            *current = None;
+        }
     }
     async fn client(&self) -> Result<GoogleClient> {
         #[cfg(test)]
@@ -396,8 +424,18 @@ mod tests {
     fn local_session_has_descriptive_identity_without_oidc_claims() {
         let auth = Auth::new(None, Some("Operatore dev".into())).unwrap();
         let (token, session) = auth.local_session().unwrap();
+        assert_eq!(auth.session(&token).unwrap().csrf, session.csrf);
+        auth.revoke_local_session(&token);
+        assert!(auth.session(&token).is_none());
+        let (rotated, next) = auth.local_session().unwrap();
+        assert_ne!(rotated, token);
+        assert_ne!(next.csrf, session.csrf);
         assert!(auth.is_local());
-        assert_eq!(auth.session(&token).unwrap().operator.name, "Operatore dev");
+        assert!(auth.session(&token).is_none());
+        assert_eq!(
+            auth.session(&rotated).unwrap().operator.name,
+            "Operatore dev"
+        );
         assert_eq!(session.operator.id, "LOCAL");
         assert!(session.operator.issuer.is_none());
         assert!(session.operator.sub.is_none());

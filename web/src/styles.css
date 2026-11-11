@@ -258,6 +258,21 @@ button.metric:hover { background: var(--neutral-bg); }
 .technical > summary { width: fit-content; cursor: pointer; font-weight: 600; }
 .technical textarea { display: block; width: 100%; margin: 7px 0; padding: 8px; color: var(--text); background: #120e0c; border: 1px solid var(--line-strong); border-radius: 6px; font: 11px/1.45 var(--mono); }
 .hint { margin: 6px 0; color: var(--muted); font-size: 11px; }
+.report-panel > .actions { justify-content: flex-start; margin: 8px 0; }
+.report-panel .report-meta { padding: 10px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.report-counts { display: flex; flex-wrap: wrap; gap: 7px; margin: 12px 0; }
+.report-counts button, .report-tag { display: inline-flex; align-items: center; padding: 3px 8px; color: var(--text-2); background: var(--neutral-bg); border: 1px solid transparent; border-radius: 14px; font-size: 10px; }
+.report-counts button { cursor: pointer; }
+.report-counts button.active { color: var(--gold-soft); background: var(--ember-bg); border-color: rgba(229, 101, 42, .4); }
+.report-counts [data-status="PASS"] { color: var(--pass); background: var(--pass-bg); }
+.report-counts [data-status="FAIL"], .report-counts [data-status="ERROR"] { color: var(--fail); background: var(--fail-bg); }
+.report-counts [data-status="WARN"] { color: var(--warn); background: var(--warn-bg); }
+.report-finding .report-tag { margin-right: 5px; }
+.report-provider { margin: 8px 0; padding: 9px 11px; background: var(--surface-2); border-left: 2px solid var(--line-strong); border-radius: 6px; }
+.report-facts { display: grid; grid-template-columns: minmax(110px, auto) 1fr; gap: 5px 12px; }
+.report-facts dt { color: var(--muted); }
+.report-facts dd { margin: 0; overflow-wrap: anywhere; }
+.report-panel code { overflow-wrap: anywhere; }
 .facts { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 12px; margin: 8px 0 0; font-size: 11px; }
 .facts dt { color: var(--muted); }
 .facts dd { margin: 0; color: var(--text); min-width: 0; }

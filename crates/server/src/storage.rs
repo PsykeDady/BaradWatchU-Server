@@ -1,4 +1,4 @@
-//! SQLite holds configuration and pairing, never audit reports or OAuth tokens.
+//! SQLite holds configuration, pairing and received report history; never OAuth tokens.
 use base64::{engine::general_purpose::STANDARD, Engine};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -166,6 +166,7 @@ impl Store {
 CREATE TABLE IF NOT EXISTS identity (singleton INTEGER PRIMARY KEY CHECK(singleton=1), seed BLOB NOT NULL, name TEXT NOT NULL, created INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS clients (id TEXT PRIMARY KEY, name TEXT NOT NULL, endpoint TEXT NOT NULL, public_key TEXT UNIQUE NOT NULL, fingerprint TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS administrators (issuer TEXT NOT NULL, sub TEXT NOT NULL, name TEXT NOT NULL DEFAULT '', email TEXT NOT NULL DEFAULT '', PRIMARY KEY(issuer,sub));
+CREATE TABLE IF NOT EXISTS received_reports (operator TEXT NOT NULL, request_id TEXT NOT NULL, client_id TEXT NOT NULL, client_name TEXT NOT NULL, fingerprint TEXT NOT NULL, completed INTEGER NOT NULL, report TEXT NOT NULL, PRIMARY KEY(operator,request_id));
 CREATE TABLE IF NOT EXISTS expected_manifest (singleton INTEGER PRIMARY KEY CHECK(singleton=1), content TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS requirement_definitions (id TEXT PRIMARY KEY, configuration TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS requirement_baselines (id TEXT PRIMARY KEY, name TEXT NOT NULL, expected_sha256 TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1);").map_err(|e|e.to_string())?;
@@ -204,44 +205,110 @@ CREATE TABLE IF NOT EXISTS requirement_baselines (id TEXT PRIMARY KEY, name TEXT
             &seed.try_into().map_err(|_| "damaged identity")?,
         ))
     }
-    pub fn expected_manifest(&self)->Result<Option<String>> {
-        self.0.lock().unwrap().query_row("SELECT content FROM expected_manifest WHERE singleton=1",[],|r|r.get(0)).optional().map_err(|e|e.to_string())
+    pub fn expected_manifest(&self) -> Result<Option<String>> {
+        self.0
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT content FROM expected_manifest WHERE singleton=1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())
     }
-    pub fn save_expected_manifest(&self,text:&str)->Result<()> {
+    pub fn save_expected_manifest(&self, text: &str) -> Result<()> {
         crate::manifest::parse(text)?;
-        self.0.lock().unwrap().execute("INSERT INTO expected_manifest(singleton,content) VALUES(1,?1) ON CONFLICT(singleton) DO UPDATE SET content=excluded.content",[text]).map_err(|e|e.to_string())?;Ok(())
+        self.0.lock().unwrap().execute("INSERT INTO expected_manifest(singleton,content) VALUES(1,?1) ON CONFLICT(singleton) DO UPDATE SET content=excluded.content",[text]).map_err(|e|e.to_string())?;
+        Ok(())
     }
-    pub fn remove_expected_manifest(&self)->Result<()> {
-        self.0.lock().unwrap().execute("DELETE FROM expected_manifest",[]).map_err(|e|e.to_string())?;Ok(())
+    pub fn remove_expected_manifest(&self) -> Result<()> {
+        self.0
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM expected_manifest", [])
+            .map_err(|e| e.to_string())?;
+        Ok(())
     }
-    pub fn requirement_definitions(&self) -> Result<Vec<crate::requirement_config::CheckConfiguration>> {
-        let c=self.0.lock().unwrap();
-        let mut q=c.prepare("SELECT configuration FROM requirement_definitions ORDER BY id").map_err(|e|e.to_string())?;
-        let rows=q.query_map([],|r|r.get::<_,String>(0)).map_err(|e|e.to_string())?;
-        rows.map(|row|serde_json::from_str(&row.map_err(|e|e.to_string())?).map_err(|e|e.to_string())).collect()
+    pub fn requirement_definitions(
+        &self,
+    ) -> Result<Vec<crate::requirement_config::CheckConfiguration>> {
+        let c = self.0.lock().unwrap();
+        let mut q = c
+            .prepare("SELECT configuration FROM requirement_definitions ORDER BY id")
+            .map_err(|e| e.to_string())?;
+        let rows = q
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        rows.map(|row| {
+            serde_json::from_str(&row.map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+        })
+        .collect()
     }
-    pub fn save_requirement_definition(&self, config:&crate::requirement_config::CheckConfiguration) -> Result<()> {
+    pub fn save_requirement_definition(
+        &self,
+        config: &crate::requirement_config::CheckConfiguration,
+    ) -> Result<()> {
         config.validate()?;
-        let text=serde_json::to_string(config).map_err(|e|e.to_string())?;
+        let text = serde_json::to_string(config).map_err(|e| e.to_string())?;
         self.0.lock().unwrap().execute("INSERT INTO requirement_definitions(id,configuration) VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET configuration=excluded.configuration",params![config.id,text]).map_err(|e|e.to_string())?;
         Ok(())
     }
-    pub fn remove_requirement_definition(&self,id:&str)->Result<()> {
-        self.0.lock().unwrap().execute("DELETE FROM requirement_definitions WHERE id=?1",[id]).map_err(|e|e.to_string())?;
+    pub fn remove_requirement_definition(&self, id: &str) -> Result<()> {
+        self.0
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM requirement_definitions WHERE id=?1", [id])
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
     pub fn requirement_baselines(&self) -> Result<Vec<RequirementBaseline>> {
         let c = self.0.lock().unwrap();
-        let mut q = c.prepare("SELECT id,name,expected_sha256,enabled FROM requirement_baselines ORDER BY id").map_err(|e|e.to_string())?;
-        let rows=q.query_map([], |r| Ok(RequirementBaseline { id:r.get(0)?, name:r.get(1)?, expected_sha256:r.get(2)?, enabled:r.get::<_,i64>(3)? != 0 })).map_err(|e|e.to_string())?;
-        rows.collect::<std::result::Result<Vec<_>,_>>().map_err(|e|e.to_string())
+        let mut q = c
+            .prepare(
+                "SELECT id,name,expected_sha256,enabled FROM requirement_baselines ORDER BY id",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = q
+            .query_map([], |r| {
+                Ok(RequirementBaseline {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    expected_sha256: r.get(2)?,
+                    enabled: r.get::<_, i64>(3)? != 0,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
     }
     pub fn save_requirement_baseline(&self, item: &RequirementBaseline) -> Result<()> {
-        if item.id.is_empty() || item.id.len() > 128 || !item.id.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) || item.name.trim().is_empty() || item.name.chars().count() > 256 || item.expected_sha256.len() != 64 || !item.expected_sha256.bytes().all(|b| b.is_ascii_hexdigit()) { return Err("invalid requirement baseline; expected ID, name and SHA-256 hex digest".into()); }
+        if item.id.is_empty()
+            || item.id.len() > 128
+            || !item
+                .id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+            || item.name.trim().is_empty()
+            || item.name.chars().count() > 256
+            || item.expected_sha256.len() != 64
+            || !item.expected_sha256.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Err(
+                "invalid requirement baseline; expected ID, name and SHA-256 hex digest".into(),
+            );
+        }
         self.0.lock().unwrap().execute("INSERT INTO requirement_baselines(id,name,expected_sha256,enabled) VALUES(?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET name=excluded.name,expected_sha256=excluded.expected_sha256,enabled=excluded.enabled", params![item.id,item.name,item.expected_sha256.to_ascii_lowercase(),item.enabled as i64]).map_err(|e|e.to_string())?;
         Ok(())
     }
-    pub fn remove_requirement_baseline(&self, id: &str) -> Result<()> { self.0.lock().unwrap().execute("DELETE FROM requirement_baselines WHERE id=?1",[id]).map_err(|e|e.to_string())?; Ok(()) }
+    pub fn remove_requirement_baseline(&self, id: &str) -> Result<()> {
+        self.0
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM requirement_baselines WHERE id=?1", [id])
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
     pub fn identity(&self) -> Result<Option<PublicIdentity>> {
         let row: Option<(Vec<u8>, String, u64)> = self
             .0
@@ -475,5 +542,170 @@ mod tests {
         assert!(s
             .import(p, "PC", "127.0.0.1:7443", &fingerprint(&k))
             .is_err());
+    }
+}
+
+impl Store {
+    /// Preserve the received JSON value, including unknown extension fields. Never synthesize an audit.
+    pub fn remember_report(
+        &self,
+        operator: &str,
+        request_id: &str,
+        client: &TrustedClient,
+        report: &serde_json::Value,
+    ) -> Result<()> {
+        let parsed = crate::report_integrity::parse(report)?;
+        let text = serde_json::to_string(report).map_err(|e| e.to_string())?;
+        let c = self.0.lock().unwrap();
+        let previous:Option<(String,String,String)>=c.query_row("SELECT client_id,fingerprint,report FROM received_reports WHERE operator=?1 AND request_id=?2",params![operator,request_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(|e|e.to_string())?;
+        if let Some((id, fingerprint, old)) = previous {
+            if id != client.id || fingerprint != client.fingerprint || old != text {
+                return Err("RECEIVED_REPORT_CHANGED".into());
+            }
+            return Ok(());
+        }
+        c.execute("INSERT INTO received_reports(operator,request_id,client_id,client_name,fingerprint,completed,report) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![operator,request_id,client.id,client.name,client.fingerprint,parsed.completed_at_unix_ms,text]).map_err(|e|e.to_string())?;
+        Ok(())
+    }
+    pub fn history(&self, operator: &str) -> Result<Vec<serde_json::Value>> {
+        let c = self.0.lock().unwrap();
+        let mut q=c.prepare("SELECT request_id,client_id,client_name,fingerprint,completed,length(CAST(report AS BLOB)) FROM received_reports WHERE operator=?1 ORDER BY completed DESC,request_id").map_err(|e|e.to_string())?;
+        let rows=q.query_map([operator],|r|Ok(serde_json::json!({"id":r.get::<_,String>(0)?,"clientId":r.get::<_,String>(1)?,"clientName":r.get::<_,String>(2)?,"fingerprint":r.get::<_,String>(3)?,"completedAtUnixMs":r.get::<_,u64>(4)?,"files":1,"bytes":r.get::<_,u64>(5)?}))).map_err(|e|e.to_string())?;
+        rows.collect::<std::result::Result<_, _>>()
+            .map_err(|e| e.to_string())
+    }
+    pub fn history_report(&self, operator: &str, id: &str) -> Result<Option<serde_json::Value>> {
+        let text: Option<String> = self
+            .0
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT report FROM received_reports WHERE operator=?1 AND request_id=?2",
+                params![operator, id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        text.map(|s| serde_json::from_str(&s).map_err(|e| e.to_string()))
+            .transpose()
+    }
+    pub fn history_usage(&self, operator: &str) -> Result<serde_json::Value> {
+        self.0.lock().unwrap().query_row("SELECT count(*),coalesce(sum(length(CAST(report AS BLOB))),0) FROM received_reports WHERE operator=?1",[operator],|r|Ok(serde_json::json!({"audits":r.get::<_,u64>(0)?,"files":r.get::<_,u64>(0)?,"bytes":r.get::<_,u64>(1)?}))).map_err(|e|e.to_string())
+    }
+    pub fn remove_history(&self, operator: &str, id: Option<&str>) -> Result<serde_json::Value> {
+        let mut c = self.0.lock().unwrap();
+        let tx = c.transaction().map_err(|e| e.to_string())?;
+        let (count,bytes):(u64,u64)=tx.query_row("SELECT count(*),coalesce(sum(length(CAST(report AS BLOB))),0) FROM received_reports WHERE operator=?1 AND (?2 IS NULL OR request_id=?2)",params![operator,id],|r|Ok((r.get(0)?,r.get(1)?))).map_err(|e|e.to_string())?;
+        tx.execute(
+            "DELETE FROM received_reports WHERE operator=?1 AND (?2 IS NULL OR request_id=?2)",
+            params![operator, id],
+        )
+        .map_err(|e| e.to_string())?;
+        let usage=tx.query_row("SELECT count(*),coalesce(sum(length(CAST(report AS BLOB))),0) FROM received_reports WHERE operator=?1",[operator],|r|Ok(serde_json::json!({"audits":r.get::<_,u64>(0)?,"files":r.get::<_,u64>(0)?,"bytes":r.get::<_,u64>(1)?}))).map_err(|e|e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(
+            serde_json::json!({"removedAudits":count,"removedFiles":count,"freedBytes":bytes,"usage":usage}),
+        )
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+    use serde_json::json;
+    fn client() -> TrustedClient {
+        TrustedClient {
+            id: "BWU-test".into(),
+            name: "Workstation".into(),
+            endpoint: "127.0.0.1:7443".into(),
+            public_key: "key".into(),
+            fingerprint: "SHA256:test".into(),
+        }
+    }
+    fn report() -> serde_json::Value {
+        json!({"schemaVersion":"baradwatchu.audit.v1","completedAtUnixMs":123,"results":[],"futureExtension":{"original":true}})
+    }
+    #[test]
+    fn history_is_scoped_to_operator_and_preserves_received_json() {
+        let store = Store::memory();
+        let value = report();
+        store
+            .remember_report("alice", "request", &client(), &value)
+            .unwrap();
+        assert_eq!(
+            store.history_report("alice", "request").unwrap(),
+            Some(value.clone())
+        );
+        assert!(store.history_report("bob", "request").unwrap().is_none());
+        assert!(store.history("bob").unwrap().is_empty());
+        assert_eq!(
+            store.remove_history("bob", Some("request")).unwrap()["removedAudits"],
+            0
+        );
+        assert_eq!(
+            store.history("alice").unwrap()[0]["clientName"],
+            "Workstation"
+        );
+        assert_eq!(store.history_usage("alice").unwrap()["audits"], 1);
+        let bytes = serde_json::to_vec(&value).unwrap().len();
+        assert_eq!(store.history_usage("alice").unwrap()["bytes"], bytes);
+    }
+    #[test]
+    fn repeated_fetch_is_idempotent_but_changed_report_is_rejected() {
+        let store = Store::memory();
+        let value = report();
+        store
+            .remember_report("alice", "request", &client(), &value)
+            .unwrap();
+        store
+            .remember_report("alice", "request", &client(), &value)
+            .unwrap();
+        assert_eq!(store.history("alice").unwrap().len(), 1);
+        let mut changed = value.clone();
+        changed["completedAtUnixMs"] = json!(124);
+        assert!(store
+            .remember_report("alice", "request", &client(), &changed)
+            .is_err());
+        assert_eq!(
+            store.history_report("alice", "request").unwrap(),
+            Some(value)
+        );
+    }
+    #[test]
+    fn delete_and_clear_remove_only_requested_operators_reports() {
+        let store = Store::memory();
+        let value = report();
+        for (operator, id) in [("alice", "one"), ("alice", "two"), ("bob", "one")] {
+            store
+                .remember_report(operator, id, &client(), &value)
+                .unwrap();
+        }
+        let removed = store.remove_history("alice", Some("one")).unwrap();
+        assert_eq!(removed["removedAudits"], 1);
+        assert_eq!(removed["usage"]["audits"], 1);
+        let removed = store.remove_history("alice", None).unwrap();
+        assert_eq!(removed["removedAudits"], 1);
+        assert_eq!(removed["usage"]["bytes"], 0);
+        assert_eq!(store.history("bob").unwrap().len(), 1);
+    }
+    #[test]
+    fn report_history_survives_database_reopen_without_request_records() {
+        let directory = std::env::temp_dir().join(format!("bwu-history-{}", random().unwrap()));
+        let value = report();
+        {
+            let store = Store::open(&directory).unwrap();
+            store
+                .remember_report("alice", "request", &client(), &value)
+                .unwrap();
+        }
+        {
+            let store = Store::open(&directory).unwrap();
+            assert_eq!(
+                store.history_report("alice", "request").unwrap(),
+                Some(value)
+            );
+            assert!(store.identity().unwrap().is_none());
+        }
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

@@ -15,8 +15,8 @@ pairing manuale Ed25519, inventario Client trusted, richieste/stati/risultati re
 JSON. Esecuzione audit, consenso e cronologia locale restano nel Client.
 
 - `crates/server/src/auth.rs`: discovery Google, scambio codice e verifica dei token firmati;
-  i token restano nel backend e vengono scartati. LOCAL crea solo una sessione loopback con
-  etichetta descrittiva operatore. Cookie Secure, HttpOnly, SameSite=Lax, limitati all'host;
+  i token restano nel backend e vengono scartati. LOCAL emette una sessione loopback con
+  etichetta descrittiva operatore e scadenza a otto ore solo al browser che presenta il token di avvio (modello Client, vedi sotto); il logout revoca il token e la sessione successiva riceve nuovi token. Cookie Secure, HttpOnly, SameSite=Lax, limitati all'host;
   le modifiche richiedono token CSRF della sessione e Origin esatto.
 - `storage.rs`: SQLite per seed identità, chiavi pubbliche/endpoint Client e amministratori
   identificati da issuer Google + subject (con ultimo nome/email verificati). Cartella dati
@@ -27,11 +27,11 @@ JSON. Esecuzione audit, consenso e cronologia locale restano nel Client.
   l'allowlist a ogni richiesta; LOCAL si affida al listener loopback verificato. La revoca
   admin OIDC vale anche per sessioni già aperte.
 - Sessioni (8 ore) e riferimenti richieste (24 ore; massimo 4096) sono in memoria e si perdono
-  al riavvio Server. Nessun database audit Server: i risultati vengono letti dal Client,
+  al riavvio Server. I report ricevuti vengono conservati nel database SQLite esistente dopo il recupero dal Client,
   che li conserva per un'ora in memoria e mantiene separatamente la cronologia locale.
   Ogni operatore recupera le proprie richieste. Un processo Server per cartella dati.
 
-Assegnazione/confronto policy, storico audit Server, scheduling, remediation, ruoli complessi,
+Distribuzione policy, scheduling, remediation, ruoli complessi,
 multi-tenancy, discovery, package nativi e packaging del servizio Server restano fuori dall'MVP.
 L'installer sorgente continua a non creare un servizio di sistema.
 
@@ -95,8 +95,21 @@ il callback Google corrispondente; LOCAL non richiede callback. Angular non avvi
 
 La modalità si seleziona con `authMode` in `server.json`. Senza file o senza `authMode`
 vale `LOCAL`; `OIDC` deve essere esplicita e richiede ancora configurazione Google e
-amministratori autorizzati. Avviare `baradwatchu-server` oppure `baradwatchu-server dashboard`,
-lasciarlo in esecuzione e aprire `http://localhost:3000`.
+amministratori autorizzati. Avviare `baradwatchu-server dashboard [--no-browser]` e lasciarlo
+in esecuzione (`baradwatchu-server` senza argomenti parte senza aprire il browser).
+
+L'avvio LOCAL segue la dashboard del Client: all'avvio il Server genera un token di avvio casuale
+di 64 caratteri esadecimali e scrive `{schemaVersion, pid, origin, port, token}` in
+`$XDG_RUNTIME_DIR/baradwatchu-server/dashboard.json` (in alternativa `<cartella dati>/run`;
+cartella 0700, file 0600), stampa il link `http://localhost:3000/?k=TOKEN` e lo apre tramite il
+launcher privato `open-dashboard.html`, così il token non compare mai su una riga di comando. Il
+browser conserva il token per scheda (sessionStorage), lo toglie dalla barra degli indirizzi e lo
+scambia una sola volta, con l'header `X-BaradWatchU-Token` su `/api/session`, per la sessione con
+cookie HttpOnly e CSRF. Senza token `/api/session` risponde 401 `LOCAL_TOKEN_REQUIRED`. Eseguire
+di nuovo `dashboard` con lo stesso utente riusa la sessione attiva (porta raggiungibile e PID che
+esegue lo stesso eseguibile), come nel Client; il record viene rimosso allo spegnimento. Solo
+l'utente che ha avviato il Server può leggere il token. Il Client usa `$XDG_RUNTIME_DIR/baradwatchu/`
+e una porta effimera, quindi i due convivono.
 L'installer usa `/usr/local`, compila come utente e richiede sudo per installare i file.
 LOCAL indica l'autenticazione runtime, non i permessi d'installazione.
 Una vecchia copia `~/.local/bin/baradwatchu-server` può precedere quella di sistema nel PATH:
@@ -126,14 +139,16 @@ Compilare la dashboard con `(cd web && npm run build)` e aprire
 loopback non autentica chi usa il browser e un servizio di sistema può risolvere il nome
 del proprio account di servizio. LOCAL richiede bind su `127.0.0.1` o `::1`, URL pubblico
 HTTP localhost con qualsiasi porta; l'avvio fallisce con bind wildcard o non loopback.
-Non vengono usati header Host o forwarded. Usarla solo su una macchina locale/dev fidata,
+Gli header `Host` del browser diversi dall'origine configurata o da `127.0.0.1`/`[::1]`/`localhost`
+con la porta di ascolto vengono rifiutati (421 `INVALID_HOST`, protezione da DNS rebinding); gli
+header forwarded non vengono mai considerati. Usarla solo su una macchina locale/dev fidata,
 mai dietro un proxy pubblico. Pairing Server/Client, mTLS, consenso esplicito e timeout
 Client di 120 secondi restano invariati.
 
-Per tornare a OIDC, impostare `"authMode": "OIDC"` (o omettere il campo) e ripristinare il
+Per tornare a OIDC, impostare `"authMode": "OIDC"` (omettendo il campo vale LOCAL) e ripristinare il
 blocco `google` da `server.example.json` con credenziali locali. Riavviare il Server.
 `/api/auth-mode` restituisce `OIDC`, `/api/session` risponde 401 prima del login Google e
-`/auth/login` avvia il flusso OIDC esistente; in OIDC la sessione LOCAL non viene emessa.
+`/auth/login` avvia il flusso OIDC esistente; in OIDC la sessione LOCAL non viene emessa. Il logout LOCAL termina la sessione del browser corrente; non identifica né disconnette l’utente del sistema operativo. Una nuova sessione richiede di nuovo il token di avvio (conservato dalla stessa scheda o riaperto con `baradwatchu-server dashboard`).
 
 ## Configurare Google OAuth
 
@@ -237,7 +252,7 @@ e nessuno dei due cancella la cronologia Client. La dashboard mantiene l'ultimo 
 memoria della scheda, associato all'operatore, per refresh finché il processo Server resta attivo.
 
 La dashboard riprende la palette Ash & Ember del Client e consente di scegliere italiano o
-inglese (preferenza salvata nel browser). Gli amministratori possono definire baseline SHA-256
+inglese (preferenza condivisa con il Client tramite language.json). Gli amministratori possono definire baseline SHA-256
 Server associate all'ID di un requisito. Per ogni audit completato il Server confronta questi
 valori con `provenance.actualSha256` e `integrityStatus` del risultato corrispondente riportato
 dal Client fidato; il confronto è restituito insieme al report Client, senza conservarne una
@@ -277,6 +292,23 @@ Al recupero, i report vengono confrontati con abilitazione, priorità, identità
 Nelle Impostazioni, incollare il testo esatto di `catalog/builtin-tools.sha256` da una versione del Client verificata indipendentemente. Viene salvato in SQLite solo dopo un’azione autorizzata esplicita; il Server non apprende automaticamente gli hash attesi dai report. Il formato è quello del Client: `REQ-ID piattaforma percorso-relativo SHA256`. Un solo manifest attivo si applica alla flotta; versioni diverse del Client possono legittimamente differire. Conservare i caratteri di fine riga originali per confrontare l’hash dell’intero manifest.
 
 I risultati confrontano l’hash osservato di ogni file e quello atteso dichiarato dal Client con le aspettative importate. Sono distinti file mancanti, aggiuntivi, duplicati e non verificati. Evidenze di installazione mancanti o piattaforma assente sono sconosciute. La corrispondenza completa richiede l’hash esatto del manifest e tutti i file attesi con identità, stato e hash dichiarati coerenti, senza file aggiuntivi. Resta un confronto di osservazioni autenticate via mTLS, non una prova di esecuzione dei controlli o una firma del report. Rimuovere il manifest elimina solo le aspettative Server; non cambia alcun Client.
+
+I test estesi con Client reale verificano anche la cronologia Server dopo l’arresto del Client, isolamento/revoca degli operatori, cancellazione e uguaglianza byte per byte dei PDF con il Client usando lo stesso tema predefinito e lingua inglese. Eseguire con preferenze Server isolate:
+
+```sh
+python3 tools/test-remote-history.py --client /percorso/assoluto/baradwatchu-agent
+# Opzionale: --artifacts /tmp/baradwatchu-pdf-review
+```
+
+La fixture disabilita i nove controlli integrati per una prova rapida di trasporto/consenso/report e accetta il consenso tramite CLI Client. Non verifica controlli privilegiati, finestre di consenso umano o login Google reale.
+
+L’intestazione PDF del Client distingue origine remota e locale; i report storici senza attribuzione indicano origine sconosciuta.
+
+### Cronologia dei report ricevuti
+
+La scheda Cronologia elenca i report recuperati dall’operatore con identità Client, data di completamento, byte JSON occupati, apertura/download/stampa e conferme di eliminazione/svuotamento. Un report aperto, come nella vista del Client, ordina gli esiti per gravità (ERROR, FAIL, WARN, …) e offre filtri sui contatori di stato e ricerca per ID o nome. Il JSON viene conservato nel database SQLite privato esistente del Server, inclusi i campi originali sconosciuti a questa versione. Non viene generato alcun audit. Rispetto alla cache su file del Client per un solo account, il Server usa il database per separare le copie per operatore e ID richiesta (i timestamp possono coincidere tra Client). I PDF vengono renderizzati su richiesta dal JSON salvato, con renderer Client e tema condiviso; non viene conservato un file PDF aggiuntivo.
+
+I report sopravvivono ai riavvii Server e alla scadenza della cache remota Client di un’ora, fino all’eliminazione esplicita. Solo l’operatore richiedente può accedervi e OIDC verifica sempre l’autorizzazione admin corrente. La rimozione della fiducia Client impedisce nuovi recuperi remoti ma conserva la cronologia già ricevuta. Recuperi ripetuti sono idempotenti; contenuti diversi per lo stesso ID richiesta vengono rifiutati. La cancellazione è locale al Server; recuperare nuovamente il risultato remoto può salvarne una nuova copia. I confronti usano le aspettative Server attuali. L’occupazione conta i byte dei contenuti JSON, non l’allocazione SQLite su disco; la cancellazione elimina i record senza garantire la riduzione immediata del file database. Non è configurata una scadenza automatica.
 
 Rilevamento installer supportato: Arch Linux, Fedora, Debian e Ubuntu, anche tramite `ID_LIKE`. `--missing-deps` controlla solo le dipendenze, rileva i package Angular locali mancanti e mostra comandi package manager/progetto; non installa pacchetti di sistema. Strumenti richiesti per compilare: Rust/Cargo 1.88+, Node.js 20 >=20.11.1, npm 8+, C/C++, make, Python 3 e tar; glibc 2.17+ è il minimo controllato sul sistema di build. Una cache precompilata e validata non richiede Node/Angular, mentre la build sorgente eseguita dall'installer compila anche questi asset.
 
