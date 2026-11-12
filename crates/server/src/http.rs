@@ -5,7 +5,7 @@ use crate::{
     storage::{self, PublicIdentity, RequirementBaseline, Store, TrustedClient},
 };
 use axum::{
-    extract::{DefaultBodyLimit, Path, Query, State},
+    extract::{rejection::JsonRejection, DefaultBodyLimit, Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -115,6 +115,9 @@ fn bad(error: impl Into<String>) -> ApiError {
 }
 fn unavailable(error: impl Into<String>) -> ApiError {
     ApiError(StatusCode::BAD_GATEWAY, error.into())
+}
+fn internal(error: impl Into<String>) -> ApiError {
+    ApiError(StatusCode::INTERNAL_SERVER_ERROR, error.into())
 }
 pub fn router() -> Router {
     Router::new().route("/health", get(health))
@@ -1503,11 +1506,43 @@ async fn server_custom_checks(State(app): State<Arc<App>>, headers: HeaderMap) -
 async fn save_server_custom_check(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
-    Json(body): Json<crate::custom_checks::CustomCheck>,
+    body: Result<Json<crate::custom_checks::CustomCheck>, JsonRejection>,
 ) -> ApiResult {
     mutation(&app, &headers)?;
-    app.store.save_server_custom_check(&body).map_err(bad)?;
-    Ok(Json(body.public_view().map_err(bad)?).into_response())
+    let Json(body) = body.map_err(|rejection| {
+        let detail = rejection.body_text();
+        eprintln!("[WARN] custom-check save rejected while decoding JSON: {detail}");
+        bad(format!("Richiesta di salvataggio non valida: {detail}"))
+    })?;
+    let tool = body.validate().map_err(|detail| {
+        eprintln!(
+            "[WARN] custom-check save rejected during validation id={:?}: {detail}",
+            body.id
+        );
+        bad(format!("Controllo personalizzato non salvato: {detail}"))
+    })?;
+    use sha2::Digest as _;
+    let sha256 = format!("{:x}", sha2::Sha256::digest(&tool));
+    eprintln!(
+        "[INFO] custom-check save requested id={:?} file={:?} tool_bytes={}",
+        body.id,
+        body.file_name,
+        tool.len()
+    );
+    if let Err(error) = app.store.save_server_custom_check(&body) {
+        eprintln!(
+            "[ERROR] custom-check persistence failed id={:?}: {error}",
+            body.id
+        );
+        return Err(internal(
+            "Il Server non è riuscito a salvare il controllo personalizzato. Consulta i log del Server.",
+        ));
+    }
+    eprintln!(
+        "[INFO] custom-check saved id={:?} tool_sha256={sha256}",
+        body.id
+    );
+    Ok(Json(body.public_view().map_err(internal)?).into_response())
 }
 async fn export_server_custom_check(
     State(app): State<Arc<App>>,

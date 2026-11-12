@@ -286,8 +286,11 @@ Requisiti con la versione Client abbinata. Il digest completo è mostrato nella 
 quello del manifest incluso è `4d4ddfb5a3b3db91adef6061acaaa0f9d8b83583c5cc4be3eb4198fef4dc3aeb`.
 Gli amministratori possono sostituire il manifest con quello di un pacchetto Client più
 recente e verificato; la modifica per tutta la flotta viene salvata in SQLite e non richiede
-la reinstallazione del Server. Il ripristino riattiva il manifest incluso nel Server
-installato. Un aggiornamento Server senza override adotta il nuovo catalogo incluso.
+la reinstallazione del Server. Nella scheda Requisiti il manifest attivo `builtin-tools.sha256`
+è mostrato in sola lettura; per sostituirlo occorre selezionare un file con quel nome esatto
+e confermare la modifica per tutta la flotta. Il ripristino riattiva il manifest incluso nel
+Server installato. Un aggiornamento Server senza override adotta il nuovo catalogo incluso.
+La sezione del manifest si trova dopo l’elenco e il modulo dei controlli personalizzati.
 
 La scheda Requisiti permette anche di creare controlli personalizzati usando i campi del
 Client: ID, nome, descrizione, priorità, file tool, argomenti e timeout. Il Server conserva

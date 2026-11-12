@@ -280,9 +280,11 @@ configurations and tool sources for Linux and Windows. This is the default expec
 and is shown on the Requirements page with the paired Client version. The bundled manifest
 digest is `4d4ddfb5a3b3db91adef6061acaaa0f9d8b83583c5cc4be3eb4198fef4dc3aeb`. Administrators can replace it
 with the exact manifest from a newer verified Client package; that fleet-wide override is
-stored in SQLite and takes effect without reinstalling the Server. Reset restores the
-manifest bundled with the installed Server. A Server upgrade without an override adopts the
-new bundled baseline.
+stored in SQLite and takes effect without reinstalling the Server. In the Requirements page,
+the active `builtin-tools.sha256` is shown read-only; replacing it requires selecting a file
+with that exact name and confirming the fleet-wide change. Reset restores the manifest
+bundled with the installed Server. A Server upgrade without an override adopts the new
+bundled baseline. This manifest section appears after the custom-check list and editor.
 
 The Requirements page also creates Server custom checks using the Client fields: ID, name,
 description, priority, tool file, arguments and timeout. The Server stores the tool and
