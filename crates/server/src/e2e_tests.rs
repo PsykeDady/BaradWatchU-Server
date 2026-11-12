@@ -165,12 +165,7 @@ async fn local_mode_operator_name_reaches_consent_and_audit_report() {
     let public: PublicIdentity = serde_json::from_str(&client.ok(&["identity", "export"])).unwrap();
     let fingerprint = public.fingerprint.clone().unwrap();
     app.store
-        .import(
-            public,
-            "Local Test Client",
-            &client.address.to_string(),
-            &fingerprint,
-        )
+        .import(public, "Local Test Client", &fingerprint)
         .unwrap();
     let router = http::application(app.clone());
     let (token, session) = app.auth.local_session().unwrap();
@@ -287,9 +282,7 @@ async fn two_oidc_admins_request_real_client_audits_with_named_consent() {
     client.start_link();
     let public: PublicIdentity = serde_json::from_str(&client.ok(&["identity", "export"])).unwrap();
     let fp = public.fingerprint.clone().unwrap();
-    app.store
-        .import(public, "Isolated Client", &client.address.to_string(), &fp)
-        .unwrap();
+    app.store.import(public, "Isolated Client", &fp).unwrap();
     let router = http::application(app.clone());
     let (stranger, csrf) = login(&router, &mock, "stranger", "Unauthorized User").await;
     assert_eq!(

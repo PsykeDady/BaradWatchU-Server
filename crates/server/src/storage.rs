@@ -107,7 +107,6 @@ impl PublicIdentity {
 pub struct TrustedClient {
     pub id: String,
     pub name: String,
-    pub endpoint: String,
     pub public_key: String,
     pub fingerprint: String,
 }
@@ -164,13 +163,30 @@ impl Store {
             .map_err(|e| e.to_string())?;
         c.execute_batch("PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS identity (singleton INTEGER PRIMARY KEY CHECK(singleton=1), seed BLOB NOT NULL, name TEXT NOT NULL, created INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS clients (id TEXT PRIMARY KEY, name TEXT NOT NULL, endpoint TEXT NOT NULL, public_key TEXT UNIQUE NOT NULL, fingerprint TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS clients (id TEXT PRIMARY KEY, name TEXT NOT NULL, public_key TEXT UNIQUE NOT NULL, fingerprint TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS administrators (issuer TEXT NOT NULL, sub TEXT NOT NULL, name TEXT NOT NULL DEFAULT '', email TEXT NOT NULL DEFAULT '', PRIMARY KEY(issuer,sub));
 CREATE TABLE IF NOT EXISTS received_reports (operator TEXT NOT NULL, request_id TEXT NOT NULL, client_id TEXT NOT NULL, client_name TEXT NOT NULL, fingerprint TEXT NOT NULL, completed INTEGER NOT NULL, report TEXT NOT NULL, PRIMARY KEY(operator,request_id));
 CREATE TABLE IF NOT EXISTS expected_manifest (singleton INTEGER PRIMARY KEY CHECK(singleton=1), content TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS requirement_definitions (id TEXT PRIMARY KEY, configuration TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS requirement_baselines (id TEXT PRIMARY KEY, name TEXT NOT NULL, expected_sha256 TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1);
 CREATE TABLE IF NOT EXISTS server_custom_checks (id TEXT PRIMARY KEY, package TEXT NOT NULL);").map_err(|e|e.to_string())?;
+        let has_endpoint = {
+            let mut statement = c
+                .prepare("PRAGMA table_info(clients)")
+                .map_err(|e| e.to_string())?;
+            let columns = statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(|e| e.to_string())?;
+            columns
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+                .iter()
+                .any(|column| column == "endpoint")
+        };
+        if has_endpoint {
+            c.execute("ALTER TABLE clients DROP COLUMN endpoint", [])
+                .map_err(|e| e.to_string())?;
+        }
         Ok(Self(Mutex::new(c)))
     }
     #[cfg(test)]
@@ -389,15 +405,14 @@ CREATE TABLE IF NOT EXISTS server_custom_checks (id TEXT PRIMARY KEY, package TE
         &self,
         identity: PublicIdentity,
         name: &str,
-        endpoint: &str,
         confirmed: &str,
     ) -> Result<TrustedClient> {
         let key = identity.key("client")?;
         if confirmed != fingerprint(&key) {
             return Err("confirm the independently verified fingerprint".into());
         }
-        if !label(name) || endpoint.parse::<std::net::SocketAddr>().is_err() {
-            return Err("provide a name and an explicit IP:port endpoint".into());
+        if !label(name) {
+            return Err("provide a Client name".into());
         }
         let own = self.signing_key()?.verifying_key().to_bytes();
         if own == key {
@@ -406,7 +421,6 @@ CREATE TABLE IF NOT EXISTS server_custom_checks (id TEXT PRIMARY KEY, package TE
         let c = TrustedClient {
             id: derived_id(&key, false),
             name: name.into(),
-            endpoint: endpoint.into(),
             public_key: STANDARD.encode(key),
             fingerprint: fingerprint(&key),
         };
@@ -414,8 +428,8 @@ CREATE TABLE IF NOT EXISTS server_custom_checks (id TEXT PRIMARY KEY, package TE
             .lock()
             .unwrap()
             .execute(
-                "INSERT INTO clients VALUES(?1,?2,?3,?4,?5)",
-                params![c.id, c.name, c.endpoint, c.public_key, c.fingerprint],
+                "INSERT INTO clients(id,name,public_key,fingerprint) VALUES(?1,?2,?3,?4)",
+                params![c.id, c.name, c.public_key, c.fingerprint],
             )
             .map_err(|_| "Client already registered")?;
         Ok(c)
@@ -423,16 +437,15 @@ CREATE TABLE IF NOT EXISTS server_custom_checks (id TEXT PRIMARY KEY, package TE
     pub fn clients(&self) -> Result<Vec<TrustedClient>> {
         let db = self.0.lock().unwrap();
         let mut s = db
-            .prepare("SELECT id,name,endpoint,public_key,fingerprint FROM clients ORDER BY name")
+            .prepare("SELECT id,name,public_key,fingerprint FROM clients ORDER BY name")
             .map_err(|e| e.to_string())?;
         let rows = s
             .query_map([], |r| {
                 Ok(TrustedClient {
                     id: r.get(0)?,
                     name: r.get(1)?,
-                    endpoint: r.get(2)?,
-                    public_key: r.get(3)?,
-                    fingerprint: r.get(4)?,
+                    public_key: r.get(2)?,
+                    fingerprint: r.get(3)?,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -580,16 +593,11 @@ mod tests {
             fingerprint: None,
             created_at_unix_ms: None,
         };
-        assert!(s
-            .import(p.clone(), "PC", "127.0.0.1:7443", "wrong")
-            .is_err());
-        s.import(p.clone(), "PC", "127.0.0.1:7443", &fingerprint(&k))
-            .unwrap();
+        assert!(s.import(p.clone(), "PC", "wrong").is_err());
+        s.import(p.clone(), "PC", &fingerprint(&k)).unwrap();
         assert_eq!(s.clients().unwrap().len(), 1);
         p.role = "server".into();
-        assert!(s
-            .import(p, "PC", "127.0.0.1:7443", &fingerprint(&k))
-            .is_err());
+        assert!(s.import(p, "PC", &fingerprint(&k)).is_err());
     }
 }
 
@@ -665,7 +673,6 @@ mod history_tests {
         TrustedClient {
             id: "BWU-test".into(),
             name: "Workstation".into(),
-            endpoint: "127.0.0.1:7443".into(),
             public_key: "key".into(),
             fingerprint: "SHA256:test".into(),
         }

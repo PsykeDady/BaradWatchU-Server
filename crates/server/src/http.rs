@@ -1,8 +1,8 @@
 use crate::{
     auth::{self, Auth, Session},
     config::Settings,
-    discovery, remote,
     storage::{self, PublicIdentity, RequirementBaseline, Store, TrustedClient},
+    tunnel,
 };
 use axum::{
     extract::{rejection::JsonRejection, DefaultBodyLimit, Path, Query, State},
@@ -24,6 +24,7 @@ pub struct App {
     pub settings: Settings,
     requests: Mutex<HashMap<String, RequestRecord>>,
     connections: tokio::sync::Semaphore,
+    pub tunnels: Arc<tunnel::Registry>,
     /// LOCAL only: random token written by the launcher to a private runtime file (Client model).
     launch_token: Option<String>,
     /// LOCAL only: Host header values accepted from browsers (DNS-rebinding guard).
@@ -82,6 +83,7 @@ impl App {
             settings,
             requests: Mutex::new(HashMap::new()),
             connections: tokio::sync::Semaphore::new(16),
+            tunnels: Arc::new(tunnel::Registry::default()),
             launch_token,
             allowed_hosts,
         }))
@@ -134,7 +136,6 @@ pub fn application(app: Arc<App>) -> Router {
         .route("/api/identity", get(identity))
         .route("/api/identity/generate", post(generate))
         .route("/api/clients", get(clients).post(import_client))
-        .route("/api/clients/discover", post(discover_client))
         .route(
             "/api/requirements",
             get(requirements).post(save_requirement),
@@ -444,32 +445,18 @@ async fn generate(
 }
 async fn clients(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult {
     admin(&app, &headers)?;
-    Ok(Json(app.store.clients().map_err(unavailable)?).into_response())
-}
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct DiscoverClient {
-    identity: PublicIdentity,
-}
-async fn discover_client(
-    State(app): State<Arc<App>>,
-    headers: HeaderMap,
-    Json(body): Json<DiscoverClient>,
-) -> ApiResult {
-    mutation(&app, &headers)?;
-    let key = body.identity.key("client").map_err(bad)?;
-    let id = storage::derived_id(&key, false);
-    let endpoints = tokio::task::spawn_blocking(move || discovery::find(&id))
-        .await
-        .map_err(|_| unavailable("discovery failed"))?;
-    Ok(Json(json!({"endpoints":endpoints})).into_response())
+    let clients: Vec<Value> = app.store.clients().map_err(unavailable)?.into_iter().map(|client| {
+        let connected = app.tunnels.connected(&client.id);
+        let reported_name = app.tunnels.reported_name(&client.id);
+        json!({"id":client.id,"name":client.name,"publicKey":client.public_key,"fingerprint":client.fingerprint,"connected":connected,"reportedName":reported_name})
+    }).collect();
+    Ok(Json(clients).into_response())
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Import {
     identity: PublicIdentity,
     name: String,
-    endpoint: String,
     confirm_fingerprint: String,
 }
 async fn import_client(
@@ -478,17 +465,11 @@ async fn import_client(
     Json(body): Json<Import>,
 ) -> ApiResult {
     mutation(&app, &headers)?;
-    Ok(Json(
-        app.store
-            .import(
-                body.identity,
-                &body.name,
-                &body.endpoint,
-                &body.confirm_fingerprint,
-            )
-            .map_err(bad)?,
-    )
-    .into_response())
+    let client = app
+        .store
+        .import(body.identity, &body.name, &body.confirm_fingerprint)
+        .map_err(bad)?;
+    Ok(Json(json!({"id":client.id,"name":client.name,"publicKey":client.public_key,"fingerprint":client.fingerprint,"connected":false})).into_response())
 }
 async fn remove_client(
     State(app): State<Arc<App>>,
@@ -497,6 +478,7 @@ async fn remove_client(
 ) -> ApiResult {
     mutation(&app, &headers)?;
     app.store.remove_client(&id).map_err(unavailable)?;
+    app.tunnels.disconnect(&id);
     Ok(Json(json!({"ok":true})).into_response())
 }
 async fn requirements(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult {
@@ -698,8 +680,8 @@ async fn request_pdf(
         .connections
         .try_acquire()
         .map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "SERVER_BUSY".into()))?;
-    let reply = remote::request(
-        app.store.signing_key().map_err(bad)?,
+    let reply = tunnel::request(
+        app.tunnels.clone(),
         r.client.clone(),
         "GET",
         format!("/v1/audit-requests/{id}/result"),
@@ -748,15 +730,9 @@ async fn forward(
         .connections
         .try_acquire()
         .map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "SERVER_BUSY".into()))?;
-    let mut reply = remote::request(
-        app.store.signing_key().map_err(bad)?,
-        r.client.clone(),
-        method,
-        path,
-        body,
-    )
-    .await
-    .map_err(unavailable)?;
+    let mut reply = tunnel::request(app.tunnels.clone(), r.client.clone(), method, path, body)
+        .await
+        .map_err(unavailable)?;
     validate_reply(&reply, id, &r.client.id, result).map_err(unavailable)?;
     if result && reply.code == 200 {
         let report = crate::report_integrity::parse(&reply.body["report"]).map_err(unavailable)?;
@@ -772,7 +748,7 @@ async fn forward(
         .into_response())
 }
 fn validate_reply(
-    reply: &remote::Reply,
+    reply: &tunnel::Reply,
     id: &str,
     device: &str,
     result: bool,
@@ -835,7 +811,6 @@ mod tests {
         let client = TrustedClient {
             id: "BWU-test".into(),
             name: "Test".into(),
-            endpoint: "127.0.0.1:7443".into(),
             public_key: "key".into(),
             fingerprint: "SHA256:test".into(),
         };

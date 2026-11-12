@@ -3,13 +3,12 @@
 pub mod client_catalog;
 pub mod config;
 pub mod custom_checks;
-pub mod discovery;
 pub mod http;
 pub mod storage;
 
 pub mod auth;
-pub mod remote;
 pub mod tls;
+pub mod tunnel;
 
 #[cfg(test)]
 mod oidc_tests;

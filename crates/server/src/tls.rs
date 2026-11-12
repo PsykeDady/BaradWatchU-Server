@@ -1,10 +1,9 @@
-// RFC 7250 requester implementation reused from Client remote.rs.
-// Keep wire compatibility covered by cross-repository remote-service tests.
+// RFC 7250 Ed25519 raw-public-key primitives shared with the Client tunnel.
 
 use rustls::{
-    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    client::danger::HandshakeSignatureValid,
     crypto::{ring, verify_tls13_signature_with_raw_key, WebPkiSupportedAlgorithms},
-    pki_types::{CertificateDer, ServerName, SubjectPublicKeyInfoDer, UnixTime},
+    pki_types::{CertificateDer, SubjectPublicKeyInfoDer},
     sign::{CertifiedKey, Signer, SigningKey},
     DigitallySignedStruct, Error, SignatureAlgorithm, SignatureScheme,
 };
@@ -106,71 +105,4 @@ impl Signer for Ed25519Signer {
     fn scheme(&self) -> SignatureScheme {
         SignatureScheme::ED25519
     }
-}
-
-/// Requester side (the Server, or the test harness): accepts exactly one Client key,
-/// the one recorded when the Client's public identity was imported out of band.
-#[derive(Debug)]
-struct PinnedClientKey([u8; 32]);
-
-impl ServerCertVerifier for PinnedClientKey {
-    fn verify_server_cert(
-        &self,
-        end_entity: &CertificateDer<'_>,
-        intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
-    ) -> Result<ServerCertVerified, Error> {
-        if intermediates.is_empty() && key_from_spki(end_entity.as_ref()) == Some(self.0) {
-            Ok(ServerCertVerified::assertion())
-        } else {
-            Err(Error::InvalidCertificate(
-                rustls::CertificateError::ApplicationVerificationFailure,
-            ))
-        }
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, Error> {
-        Err(Error::General("TLS 1.2 is not supported".into()))
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, Error> {
-        verify_signature(message, cert, dss)
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![SignatureScheme::ED25519]
-    }
-
-    fn requires_raw_public_keys(&self) -> bool {
-        true
-    }
-}
-
-/// TLS configuration for a requester holding `requester_key` that talks to the Client
-/// whose public key is `client_public_key`. Connect with server name = Device ID.
-pub fn requester_config(
-    requester_key: ed25519_dalek::SigningKey,
-    client_public_key: [u8; 32],
-) -> Result<Arc<rustls::ClientConfig>, Error> {
-    let certified = Arc::new(Ed25519Key::new(requester_key).certified());
-    let config = rustls::ClientConfig::builder_with_provider(Arc::new(provider()))
-        .with_protocol_versions(&[&rustls::version::TLS13])?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(PinnedClientKey(client_public_key)))
-        .with_client_cert_resolver(Arc::new(
-            rustls::client::AlwaysResolvesClientRawPublicKeys::new(certified),
-        ));
-    Ok(Arc::new(config))
 }

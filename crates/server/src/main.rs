@@ -100,6 +100,12 @@ async fn run_server(config: Config, open_browser: bool) -> io::Result<()> {
     let origin = settings.origin().to_owned();
     let app = baradwatchu_server::http::App::with_listen_address(store, settings, Some(address))
         .map_err(io::Error::other)?;
+    let tunnel_address: std::net::SocketAddr = std::env::var("BARADWATCHU_SERVER_TUNNEL_ADDR")
+        .unwrap_or_else(|_| "0.0.0.0:7445".into())
+        .parse()
+        .map_err(|_| io::Error::other("invalid BARADWATCHU_SERVER_TUNNEL_ADDR"))?;
+    baradwatchu_server::tunnel::listen(app.clone(), tunnel_address).map_err(io::Error::other)?;
+    println!("Client tunnel listening on {tunnel_address}");
     // LOCAL: publish the launch token only in the owner's private runtime folder (Client model).
     let runtime = match app.launch_token() {
         Some(token) => {
@@ -180,7 +186,7 @@ fn parse_start(args: &[std::ffi::OsString]) -> Result<Start, String> {
         }
         [flag] if flag == "--help" || flag == "-h" => {
             println!(
-                "BaradWatchU Server {}\n\nUsage: baradwatchu-server [dashboard [--no-browser] | OPTIONS]\n\nOptions:\n  -h, --help       Show this help and exit\n  -V, --version    Show product version and exit\n\nStart without arguments (no browser) or with dashboard, which reuses a running\nLOCAL Server of this user or starts one and opens the browser; keep it running.\nWithout server.json, the full dashboard uses LOCAL authentication on loopback:\nthe launch link carries a random token stored only in\n$XDG_RUNTIME_DIR/baradwatchu-server/dashboard.json (owner-only).\nConfiguration: BARADWATCHU_SERVER_CONFIG, /etc/baradwatchu/server.json,\nthen ~/.config/baradwatchu/server.json.\nThe server listens at 127.0.0.1:3000 by default. Set\nBARADWATCHU_SERVER_ADDR to an IP address and port (IPv6: [::1]:3000).\nCtrl-C or SIGTERM drains HTTP connections before shutdown on Linux.\nConfigure the dashboard/OIDC with BARADWATCHU_SERVER_CONFIG (local JSON file).\nPersistent state: BARADWATCHU_SERVER_DATA_DIR (owner-only directory).\n\nLocal provisioning:\n  setup identity generate NAME\n  setup identity export\n  setup admin allow GOOGLE_SUB\n  setup admin revoke GOOGLE_SUB\n  setup client import FILE IP:PORT NAME SHA256:FINGERPRINT",
+                "BaradWatchU Server {}\n\nUsage: baradwatchu-server [dashboard [--no-browser] | OPTIONS]\n\nOptions:\n  -h, --help       Show this help and exit\n  -V, --version    Show product version and exit\n\nStart without arguments (no browser) or with dashboard, which reuses a running\nLOCAL Server of this user or starts one and opens the browser; keep it running.\nWithout server.json, the full dashboard uses LOCAL authentication on loopback:\nthe launch link carries a random token stored only in\n$XDG_RUNTIME_DIR/baradwatchu-server/dashboard.json (owner-only).\nConfiguration: BARADWATCHU_SERVER_CONFIG, /etc/baradwatchu/server.json,\nthen ~/.config/baradwatchu/server.json.\nThe server listens at 127.0.0.1:3000 by default. Set\nBARADWATCHU_SERVER_ADDR to an IP address and port (IPv6: [::1]:3000).\nCtrl-C or SIGTERM drains HTTP connections before shutdown on Linux.\nConfigure the dashboard/OIDC with BARADWATCHU_SERVER_CONFIG (local JSON file).\nPersistent state: BARADWATCHU_SERVER_DATA_DIR (owner-only directory).\n\nLocal provisioning:\n  setup identity generate NAME\n  setup identity export\n  setup admin allow GOOGLE_SUB\n  setup admin revoke GOOGLE_SUB\n  setup client import FILE NAME",
                 env!("CARGO_PKG_VERSION")
             );
             Ok(Start::Done)
@@ -201,11 +207,12 @@ fn provision(args: &[String]) -> Result<(), String> {
         ["identity","export"] => serde_json::to_value(store.identity()?.ok_or("identity not generated")?).unwrap(),
         ["admin","allow",sub] => {store.allow(sub)?;serde_json::json!({"allowed":sub})},
         ["admin","revoke",sub] => {store.revoke(sub)?;serde_json::json!({"revoked":sub})},
-        ["client","import",file,endpoint,name,fingerprint] => {
+        ["client","import",file,name] => {
             let identity:PublicIdentity=serde_json::from_slice(&std::fs::read(file).map_err(|_|"cannot read Client identity")?).map_err(|_|"invalid Client identity JSON")?;
-            serde_json::to_value(store.import(identity,name,endpoint,fingerprint)?).unwrap()
+            let fingerprint = baradwatchu_server::storage::fingerprint(&identity.key("client")?);
+            serde_json::to_value(store.import(identity,name,&fingerprint)?).unwrap()
         },
-        _ => return Err("Usage: setup identity generate NAME | setup identity export | setup admin allow SUB | setup admin revoke SUB | setup client import FILE IP:PORT NAME FINGERPRINT".into()),
+        _ => return Err("Usage: setup identity generate NAME | setup identity export | setup admin allow SUB | setup admin revoke SUB | setup client import FILE NAME".into()),
     };
     println!("{}", serde_json::to_string_pretty(&output).unwrap());
     Ok(())

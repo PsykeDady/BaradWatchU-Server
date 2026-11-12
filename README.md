@@ -18,11 +18,11 @@ Client audit execution, consent and local history remain in the Client.
   tokens stay in the backend and are discarded. LOCAL issues a random, eight-hour loopback session with a
   descriptive operator label only to a browser presenting the launch token (Client model, see below); logout revokes it and the next session receives fresh tokens. Cookies are Secure, HttpOnly, SameSite=Lax, host-only; mutations
   require session CSRF token and exact Origin.
-- `storage.rs`: SQLite identity seed, trusted Client public keys/endpoints, administrators
+- `storage.rs`: SQLite identity seed, trusted Client public keys, administrators
   keyed by Google issuer + subject (with latest verified display name/email). Owner-only
   data directory (0700) and database (0600); no automatic identity generation.
-- `remote.rs`, `tls.rs`: existing Client protocol, TLS 1.3/raw Ed25519 keys, exact Client key
-  pinning and Device ID SNI. No TOFU or automatic trust.
+- `tunnel.rs`, `tls.rs`: outbound Client tunnel listener, TLS 1.3/raw Ed25519 keys,
+  reciprocal trust checks and live connection registry. No TOFU or automatic trust.
 - `http.rs`: protected fleet APIs and built Angular assets on the same origin. OIDC checks the
   allowlist on each request; LOCAL relies on its enforced loopback listener. OIDC admin
   revocation affects already-open sessions.
@@ -229,18 +229,13 @@ Generation refuses to replace an existing identity. Import `server-public.json` 
 with `baradwatchu-agent trust import server-public.json`, after independently checking the
 fingerprint. Export the Client identity (`baradwatchu-agent identity export --output client-public.json`)
 and select that JSON file in the Server dashboard. Its name and fingerprint appear from the file;
-no fingerprint transcription is needed. The Server searches for the Client service over UDP port
-7444 on the local network (and loopback). If no endpoint is found, enter IP:port. Discovery only
-provides an address hint: the imported public key remains the trust anchor, and mTLS checks it
-when an audit is requested. On success, the form clears and shows the registered Client. The
-local CLI equivalent, which retains independent fingerprint confirmation, is:
+no fingerprint transcription is needed. Check the displayed fingerprint independently before confirming. The imported public key remains the trust anchor. No Client address is stored. On success, the form clears and shows the registered Client. The local CLI equivalent is:
 
 ```sh
-./target/debug/baradwatchu-server setup client import client-public.json 192.0.2.10:7443 "Workstation" SHA256:VERIFIED_FINGERPRINT
+./target/debug/baradwatchu-server setup client import client-public.json "Workstation"
 ```
 
-The Client needs its existing system service listener configured, `remote enable`, and a linked
-user session/tray. Configure firewall/routing manually. Use the updated Client service **and**
+The Client needs its system service running, `remote enable`, and its **Active connections** tab configured with this Server's DNS or IP and tunnel port (default 7445). The Client opens the authenticated channel; the Server fleet shows **Connected** only while it is live. The Server tunnel listens on `0.0.0.0:7445` by default (override with `BARADWATCHU_SERVER_TUNNEL_ADDR`); expose only that mTLS port, while LOCAL dashboard HTTP stays on loopback. A linked user session/tray is required for consent. Configure firewall/routing for the Server port. Use the updated Client service **and**
 user agent: earlier strict v1 readers reject the optional requester metadata. No automatic
 fallback drops attribution. Select **Request audit** in the Server dashboard; the Client asks
 for consent naming the Google operator and the Server. Only local acceptance within **120
