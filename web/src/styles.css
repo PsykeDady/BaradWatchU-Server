@@ -80,6 +80,9 @@ h2 { font-family: var(--display); letter-spacing: .03em; }
 .notice { display: flex; align-items: center; gap: 10px; margin: 10px 0; padding: 11px 13px; border: 1px solid transparent; border-radius: 8px; font-size: 12px; backdrop-filter: blur(6px); }
 .notice.error { color: #ffb4a6; background: rgba(60, 16, 10, .92); border-color: rgba(236, 90, 67, .4); }
 .notice.success { color: #cfe0b4; background: rgba(28, 36, 18, .92); border-color: rgba(156, 184, 111, .35); }
+.pairing-preview { display: grid; gap: 12px; margin-top: 16px; padding: 16px; border: 1px solid var(--line-strong); border-radius: 10px; background: var(--surface-2); }
+.pairing-preview p { margin: 0; }
+.pairing-preview code { overflow-wrap: anywhere; }
 .notice-icon { width: 19px; height: 19px; display: grid; flex: none; place-items: center; border-radius: 50%; background: rgba(255, 255, 255, .08); font-weight: 800; }
 .notice .text-button { margin-left: auto; }
 .dismiss { margin-left: auto; padding: 0 4px; color: inherit; background: transparent; border: 0; font-size: 19px; }

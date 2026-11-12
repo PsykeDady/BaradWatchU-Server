@@ -1,7 +1,7 @@
 use crate::{
     auth::{self, Auth, Session},
     config::Settings,
-    remote,
+    discovery, remote,
     storage::{self, PublicIdentity, RequirementBaseline, Store, TrustedClient},
 };
 use axum::{
@@ -134,6 +134,7 @@ pub fn application(app: Arc<App>) -> Router {
         .route("/api/identity", get(identity))
         .route("/api/identity/generate", post(generate))
         .route("/api/clients", get(clients).post(import_client))
+        .route("/api/clients/discover", post(discover_client))
         .route(
             "/api/requirements",
             get(requirements).post(save_requirement),
@@ -444,6 +445,24 @@ async fn generate(
 async fn clients(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult {
     admin(&app, &headers)?;
     Ok(Json(app.store.clients().map_err(unavailable)?).into_response())
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DiscoverClient {
+    identity: PublicIdentity,
+}
+async fn discover_client(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Json(body): Json<DiscoverClient>,
+) -> ApiResult {
+    mutation(&app, &headers)?;
+    let key = body.identity.key("client").map_err(bad)?;
+    let id = storage::derived_id(&key, false);
+    let endpoints = tokio::task::spawn_blocking(move || discovery::find(&id))
+        .await
+        .map_err(|_| unavailable("discovery failed"))?;
+    Ok(Json(json!({"endpoints":endpoints})).into_response())
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

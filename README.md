@@ -22,7 +22,7 @@ Client audit execution, consent and local history remain in the Client.
   keyed by Google issuer + subject (with latest verified display name/email). Owner-only
   data directory (0700) and database (0600); no automatic identity generation.
 - `remote.rs`, `tls.rs`: existing Client protocol, TLS 1.3/raw Ed25519 keys, exact Client key
-  pinning and Device ID SNI. No TOFU, discovery or automatic pairing.
+  pinning and Device ID SNI. No TOFU or automatic trust.
 - `http.rs`: protected fleet APIs and built Angular assets on the same origin. OIDC checks the
   allowlist on each request; LOCAL relies on its enforced loopback listener. OIDC admin
   revocation affects already-open sessions.
@@ -32,7 +32,7 @@ Client audit execution, consent and local history remain in the Client.
   Each operator can retrieve their own requests. One Server process per data directory.
 
 Policy distribution, scheduling, remediation,
-complex roles, multi-tenancy, discovery, native packages and Server service packaging remain
+complex roles, multi-tenancy, native packages and Server service packaging remain
 outside this MVP. The source installer still does not create a system service.
 
 ## Version and CLI
@@ -227,8 +227,13 @@ Generate the Server identity through the authorized dashboard, or explicitly:
 
 Generation refuses to replace an existing identity. Import `server-public.json` on the Client
 with `baradwatchu-agent trust import server-public.json`, after independently checking the
-fingerprint. Export the Client identity (`baradwatchu-agent identity export`) and register it
-in the Server dashboard with its verified fingerprint, name and IP:port. The local equivalent is:
+fingerprint. Export the Client identity (`baradwatchu-agent identity export --output client-public.json`)
+and select that JSON file in the Server dashboard. Its name and fingerprint appear from the file;
+no fingerprint transcription is needed. The Server searches for the Client service over UDP port
+7444 on the local network (and loopback). If no endpoint is found, enter IP:port. Discovery only
+provides an address hint: the imported public key remains the trust anchor, and mTLS checks it
+when an audit is requested. On success, the form clears and shows the registered Client. The
+local CLI equivalent, which retains independent fingerprint confirmation, is:
 
 ```sh
 ./target/debug/baradwatchu-server setup client import client-public.json 192.0.2.10:7443 "Workstation" SHA256:VERIFIED_FINGERPRINT

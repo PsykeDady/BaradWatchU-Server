@@ -225,8 +225,14 @@ Generare l'identità Server dalla dashboard autorizzata oppure esplicitamente:
 
 La generazione rifiuta di sostituire un'identità esistente. Importare `server-public.json` sul
 Client con `baradwatchu-agent trust import server-public.json`, dopo verifica indipendente del
-fingerprint. Esportare l'identità Client (`baradwatchu-agent identity export`) e registrarla nella
-dashboard Server con fingerprint verificato, nome e IP:porta. Il comando locale equivalente è:
+fingerprint. Esportare l'identità Client (`baradwatchu-agent identity export --output client-public.json`)
+e selezionare il file JSON nella dashboard Server. Nome e fingerprint sono mostrati dal file;
+non occorre riscrivere il fingerprint. Il Server cerca il servizio Client sulla rete locale
+tramite UDP porta 7444 (e su loopback). Se non trova l'indirizzo, inserire IP:porta. La discovery
+fornisce solo un indirizzo candidato: la chiave pubblica importata rimane la base della fiducia
+e mTLS la verifica quando si richiede un audit. Dopo la registrazione il modulo si svuota e
+mostra il Client registrato. Il comando CLI equivalente mantiene la verifica indipendente del
+fingerprint:
 
 ```sh
 ./target/debug/baradwatchu-server setup client import client-public.json 192.0.2.10:7443 "Workstation" SHA256:VERIFIED_FINGERPRINT

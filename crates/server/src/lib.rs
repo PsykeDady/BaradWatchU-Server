@@ -3,6 +3,7 @@
 pub mod client_catalog;
 pub mod config;
 pub mod custom_checks;
+pub mod discovery;
 pub mod http;
 pub mod storage;
 
