@@ -249,8 +249,8 @@ contain the same attribution. The trusted Server key authenticates the request; 
 never does. Older reports remain readable with unknown origin. Google email/sub are not sent
 to the Client. The one-hour result lifetime is separate from the 120-second consent timeout;
 Client service restart loses in-memory results, Server restart loses routing records/sessions,
-and neither erases Client history. The dashboard retains the last request ID in tab storage,
-scoped to the operator, for refresh while the Server process survives.
+and neither erases Client history. The dashboard lists every request still held by the Server
+for the requesting operator (up to 24 hours), rather than retaining only the last ID in the tab.
 
 The dashboard follows the Client's Ash & Ember palette and offers Italian/English selection
 (shared with the Client through language.json). Its Requirements tab lists the paired Client
@@ -313,7 +313,7 @@ The Client PDF header labels remote and local origin separately; legacy reports 
 
 ### Received report history
 
-The History tab lists your retrieved reports with Client identity, completion time, JSON byte usage, open/download/print actions and delete/clear confirmations. An opened report, like the Client view, sorts findings by severity (ERROR, FAIL, WARN, …) and offers status counter filters plus search by ID or name. JSON is retained in the existing private Server SQLite database, including original fields unknown to this Server version. No audit is generated. Unlike the Client's single-account file cache, the Server uses its database to scope copies by operator and request ID (timestamps can collide across Clients). PDFs are rendered on demand from saved JSON using the Client renderer and shared theme; no additional PDF file is retained.
+The Remote audits tab lists requests and saved reports as compact rows with Client identity, date and state. Open a row to see request details or a received report; only the opened report renders its findings, PDF and JSON actions. Active requests are refreshed while the dashboard is open, and completed reports are retrieved and saved. Request routing and statuses remain in Server memory for up to 24 hours; saved reports persist across restarts. Deleting or clearing removes only saved copies. An opened report, like the Client view, sorts findings by severity (ERROR, FAIL, WARN, …) and offers status counter filters plus search by ID or name. JSON is retained in the existing private Server SQLite database, including original fields unknown to this Server version. No audit is generated. Unlike the Client's single-account file cache, the Server uses its database to scope copies by operator and request ID (timestamps can collide across Clients). PDFs are rendered on demand from saved JSON using the Client renderer and shared theme; no additional PDF file is retained.
 
 Reports survive Server restarts and the Client's one-hour remote cache expiration, until explicitly deleted. Only the requesting operator may access them, and OIDC still checks current admin authorization. Removing Client trust prevents new remote retrieval but leaves already received history available. Repeated retrieval is idempotent; changed content under the same request ID is rejected. Deletion is local to the Server; retrieving the remote result again can save a new copy. Comparisons use current Server expectations. Usage counts JSON payload bytes, not SQLite disk allocation; deletion releases logical records without guaranteeing an immediate database-file shrink. No automatic retention policy is configured.
 

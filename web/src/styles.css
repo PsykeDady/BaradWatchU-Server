@@ -372,6 +372,9 @@ button.metric:hover { background: var(--neutral-bg); }
 .server-panel h2 { font-size: 18px; }
 .client,.finding-title,.actions,.fields { display:flex; gap:14px; flex-wrap:wrap; align-items:center; justify-content:space-between; }
 .client,.finding { padding:16px 0; border-top:1px solid var(--line); }
+.audit-row { display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap; }
+.audit-row h3 { margin:0 0 5px; }
+.audit-row p { margin:0; }
 .client small,.fingerprint,code { overflow-wrap:anywhere; }
 .server-panel button:not(.tab),a.button { min-height:40px; padding:8px 15px; border:1px solid var(--line-strong); border-radius:8px; color:var(--text); background:var(--surface-3); }
 .server-panel button:not(.secondary) { background:linear-gradient(180deg,var(--ember),var(--ember-deep)); color:#fff8ef; }

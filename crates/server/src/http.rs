@@ -36,6 +36,7 @@ struct RequestRecord {
     operator_id: String,
     issued: u64,
     requester: Value,
+    status: Value,
 }
 fn requester_metadata(operator_name: &str, server_name: &str) -> Value {
     json!({"operatorDisplayName":operator_name,"serverDisplayName":server_name})
@@ -146,6 +147,7 @@ pub fn application(app: Arc<App>) -> Router {
         )
         .route("/api/clients/{id}", axum::routing::delete(remove_client))
         .route("/api/clients/{id}/requests", post(create_request))
+        .route("/api/requests", get(list_requests))
         .route("/api/requests/{id}", get(request_status))
         .route("/api/requests/{id}/result", get(request_result))
         .route("/api/requests/{id}/pdf", get(request_pdf))
@@ -578,6 +580,7 @@ async fn create_request(
                     &s.operator.name,
                     identity.name.as_deref().unwrap_or("BaradWatchU Server"),
                 ),
+                status: json!({"state":"QUEUED","resultAvailable":false}),
             };
             requests.insert(body.request_id.clone(), r.clone());
             r
@@ -594,6 +597,20 @@ async fn create_request(
         false,
     )
     .await
+}
+async fn list_requests(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult {
+    let s = admin(&app, &headers)?;
+    let now = storage::now_ms();
+    let mut entries: Vec<Value> = app.requests.lock().unwrap().iter()
+        .filter(|(_, r)| r.operator_id == s.operator.id && now.saturating_sub(r.issued) < 24 * 60 * 60 * 1000)
+        .map(|(id, r)| json!({"requestId":id,"clientId":r.client.id,"clientName":r.client.name,"issuedAtUnixMs":r.issued,"status":r.status}))
+        .collect();
+    entries.sort_by(|a, b| {
+        b["issuedAtUnixMs"]
+            .as_u64()
+            .cmp(&a["issuedAtUnixMs"].as_u64())
+    });
+    Ok(Json(entries).into_response())
 }
 fn record(app: &App, headers: &HeaderMap, id: &str) -> Result<RequestRecord, ApiError> {
     let s = admin(app, headers)?;
@@ -734,6 +751,11 @@ async fn forward(
         .await
         .map_err(unavailable)?;
     validate_reply(&reply, id, &r.client.id, result).map_err(unavailable)?;
+    if !result && reply.body["state"].is_string() {
+        if let Some(saved) = app.requests.lock().unwrap().get_mut(id) {
+            saved.status = reply.body.clone();
+        }
+    }
     if result && reply.code == 200 {
         let report = crate::report_integrity::parse(&reply.body["report"]).map_err(unavailable)?;
         app.store

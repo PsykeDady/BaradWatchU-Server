@@ -249,8 +249,8 @@ stessa attribuzione. La chiave trusted del Server autentica la richiesta; il nom
 I vecchi report restano leggibili con origine sconosciuta. Email/sub Google non sono inviati
 al Client. La durata del risultato di un'ora è distinta dai 120 secondi del consenso; il riavvio
 del servizio Client perde i risultati in memoria, quello Server perde riferimenti/sessioni,
-e nessuno dei due cancella la cronologia Client. La dashboard mantiene l'ultimo ID nella
-memoria della scheda, associato all'operatore, per refresh finché il processo Server resta attivo.
+e nessuno dei due cancella la cronologia Client. La dashboard elenca tutte le richieste ancora
+conservate dal Server per l'operatore richiedente (fino a 24 ore), non solo l'ultimo ID della scheda.
 
 La dashboard riprende la palette Ash & Ember del Client e consente di scegliere italiano o
 inglese (preferenza condivisa con il Client tramite language.json). La scheda Requisiti elenca
@@ -321,7 +321,7 @@ L’intestazione PDF del Client distingue origine remota e locale; i report stor
 
 ### Cronologia dei report ricevuti
 
-La scheda Cronologia elenca i report recuperati dall’operatore con identità Client, data di completamento, byte JSON occupati, apertura/download/stampa e conferme di eliminazione/svuotamento. Un report aperto, come nella vista del Client, ordina gli esiti per gravità (ERROR, FAIL, WARN, …) e offre filtri sui contatori di stato e ricerca per ID o nome. Il JSON viene conservato nel database SQLite privato esistente del Server, inclusi i campi originali sconosciuti a questa versione. Non viene generato alcun audit. Rispetto alla cache su file del Client per un solo account, il Server usa il database per separare le copie per operatore e ID richiesta (i timestamp possono coincidere tra Client). I PDF vengono renderizzati su richiesta dal JSON salvato, con renderer Client e tema condiviso; non viene conservato un file PDF aggiuntivo.
+La scheda Audit remoti elenca richieste e report salvati in righe compatte con identità Client, data e stato. Aprendo una riga si vedono i dettagli della richiesta o il report ricevuto; solo il report aperto mostra esiti, PDF e azioni JSON. Le richieste attive vengono aggiornate mentre la dashboard è aperta e i report completati vengono recuperati e salvati. Instradamento e stati delle richieste restano in memoria Server fino a 24 ore; i report salvati persistono dopo il riavvio. Eliminare o svuotare rimuove solo le copie salvate. Un report aperto, come nella vista del Client, ordina gli esiti per gravità (ERROR, FAIL, WARN, …) e offre filtri sui contatori di stato e ricerca per ID o nome. Il JSON viene conservato nel database SQLite privato esistente del Server, inclusi i campi originali sconosciuti a questa versione. Non viene generato alcun audit. Rispetto alla cache su file del Client per un solo account, il Server usa il database per separare le copie per operatore e ID richiesta (i timestamp possono coincidere tra Client). I PDF vengono renderizzati su richiesta dal JSON salvato, con renderer Client e tema condiviso; non viene conservato un file PDF aggiuntivo.
 
 I report sopravvivono ai riavvii Server e alla scadenza della cache remota Client di un’ora, fino all’eliminazione esplicita. Solo l’operatore richiedente può accedervi e OIDC verifica sempre l’autorizzazione admin corrente. La rimozione della fiducia Client impedisce nuovi recuperi remoti ma conserva la cronologia già ricevuta. Recuperi ripetuti sono idempotenti; contenuti diversi per lo stesso ID richiesta vengono rifiutati. La cancellazione è locale al Server; recuperare nuovamente il risultato remoto può salvarne una nuova copia. I confronti usano le aspettative Server attuali. L’occupazione conta i byte dei contenuti JSON, non l’allocazione SQLite su disco; la cancellazione elimina i record senza garantire la riduzione immediata del file database. Non è configurata una scadenza automatica.
 
