@@ -70,6 +70,8 @@ pub struct PublicIdentity {
     pub fingerprint: Option<String>,
     #[serde(default)]
     pub created_at_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable_sha256: Option<String>,
 }
 impl PublicIdentity {
     pub fn key(&self, role: &str) -> Result<[u8; 32]> {
@@ -99,8 +101,18 @@ impl PublicIdentity {
         {
             return Err("identity fingerprint or ID mismatch".into());
         }
+        if self
+            .executable_sha256
+            .as_deref()
+            .is_some_and(|sha| !valid_sha256(sha))
+        {
+            return Err("invalid Client executable SHA-256".into());
+        }
         Ok(key)
     }
+}
+pub fn valid_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -167,6 +179,8 @@ CREATE TABLE IF NOT EXISTS clients (id TEXT PRIMARY KEY, name TEXT NOT NULL, pub
 CREATE TABLE IF NOT EXISTS administrators (issuer TEXT NOT NULL, sub TEXT NOT NULL, name TEXT NOT NULL DEFAULT '', email TEXT NOT NULL DEFAULT '', PRIMARY KEY(issuer,sub));
 CREATE TABLE IF NOT EXISTS received_reports (operator TEXT NOT NULL, request_id TEXT NOT NULL, client_id TEXT NOT NULL, client_name TEXT NOT NULL, fingerprint TEXT NOT NULL, completed INTEGER NOT NULL, report TEXT NOT NULL, PRIMARY KEY(operator,request_id));
 CREATE TABLE IF NOT EXISTS expected_manifest (singleton INTEGER PRIMARY KEY CHECK(singleton=1), content TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS manifest_sha_override (singleton INTEGER PRIMARY KEY CHECK(singleton=1), sha256 TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS client_executable_sha (client_id TEXT PRIMARY KEY REFERENCES clients(id) ON DELETE CASCADE, imported_sha256 TEXT, override_sha256 TEXT);
 CREATE TABLE IF NOT EXISTS requirement_definitions (id TEXT PRIMARY KEY, configuration TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS requirement_baselines (id TEXT PRIMARY KEY, name TEXT NOT NULL, expected_sha256 TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1);
 CREATE TABLE IF NOT EXISTS server_custom_checks (id TEXT PRIMARY KEY, package TEXT NOT NULL);").map_err(|e|e.to_string())?;
@@ -245,6 +259,56 @@ CREATE TABLE IF NOT EXISTS server_custom_checks (id TEXT PRIMARY KEY, package TE
             .unwrap()
             .execute("DELETE FROM expected_manifest", [])
             .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    pub fn manifest_sha_override(&self) -> Result<Option<String>> {
+        self.0
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT sha256 FROM manifest_sha_override WHERE singleton=1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+    }
+    pub fn set_manifest_sha_override(&self, sha: Option<&str>) -> Result<()> {
+        if let Some(value) = sha {
+            if !valid_sha256(value) {
+                return Err("invalid manifest SHA-256".into());
+            }
+            self.0.lock().unwrap().execute("INSERT INTO manifest_sha_override(singleton,sha256) VALUES(1,?1) ON CONFLICT(singleton) DO UPDATE SET sha256=excluded.sha256",[value.to_ascii_lowercase()]).map_err(|e|e.to_string())?;
+        } else {
+            self.0
+                .lock()
+                .unwrap()
+                .execute("DELETE FROM manifest_sha_override", [])
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+    pub fn client_executable_sha(&self, id: &str) -> Result<(Option<String>, Option<String>)> {
+        self.0.lock().unwrap().query_row("SELECT imported_sha256,override_sha256 FROM client_executable_sha WHERE client_id=?1",[id],|r|Ok((r.get(0)?,r.get(1)?))).optional().map(|row|row.unwrap_or((None,None))).map_err(|e|e.to_string())
+    }
+    pub fn set_client_executable_sha_override(&self, id: &str, sha: Option<&str>) -> Result<()> {
+        if let Some(value) = sha {
+            if !valid_sha256(value) {
+                return Err("invalid Client executable SHA-256".into());
+            }
+        }
+        let db = self.0.lock().unwrap();
+        let exists: bool = db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM clients WHERE id=?1)",
+                [id],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if !exists {
+            return Err("CLIENT_NOT_REGISTERED".into());
+        }
+        db.execute("INSERT INTO client_executable_sha(client_id,override_sha256) VALUES(?1,?2) ON CONFLICT(client_id) DO UPDATE SET override_sha256=excluded.override_sha256",params![id,sha.map(str::to_ascii_lowercase)]).map_err(|e|e.to_string())?;
         Ok(())
     }
     pub fn requirement_definitions(
@@ -397,6 +461,7 @@ CREATE TABLE IF NOT EXISTS server_custom_checks (id TEXT PRIMARY KEY, package TE
                 name: Some(name),
                 fingerprint: Some(fingerprint(&key)),
                 created_at_unix_ms: Some(created),
+                executable_sha256: None,
             })
         })
         .transpose()
@@ -424,14 +489,21 @@ CREATE TABLE IF NOT EXISTS server_custom_checks (id TEXT PRIMARY KEY, package TE
             public_key: STANDARD.encode(key),
             fingerprint: fingerprint(&key),
         };
-        self.0
-            .lock()
-            .unwrap()
-            .execute(
-                "INSERT INTO clients(id,name,public_key,fingerprint) VALUES(?1,?2,?3,?4)",
-                params![c.id, c.name, c.public_key, c.fingerprint],
+        let mut db = self.0.lock().unwrap();
+        let tx = db.transaction().map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT INTO clients(id,name,public_key,fingerprint) VALUES(?1,?2,?3,?4)",
+            params![c.id, c.name, c.public_key, c.fingerprint],
+        )
+        .map_err(|_| "Client already registered")?;
+        if let Some(sha) = identity.executable_sha256 {
+            tx.execute(
+                "INSERT INTO client_executable_sha(client_id,imported_sha256) VALUES(?1,?2)",
+                params![c.id, sha.to_ascii_lowercase()],
             )
-            .map_err(|_| "Client already registered")?;
+            .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
         Ok(c)
     }
     pub fn clients(&self) -> Result<Vec<TrustedClient>> {
@@ -592,6 +664,7 @@ mod tests {
             name: None,
             fingerprint: None,
             created_at_unix_ms: None,
+            executable_sha256: None,
         };
         assert!(s.import(p.clone(), "PC", "wrong").is_err());
         s.import(p.clone(), "PC", &fingerprint(&k)).unwrap();
@@ -644,6 +717,18 @@ impl Store {
             .map_err(|e| e.to_string())?;
         text.map(|s| serde_json::from_str(&s).map_err(|e| e.to_string()))
             .transpose()
+    }
+    pub fn history_client_id(&self, operator: &str, id: &str) -> Result<Option<String>> {
+        self.0
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT client_id FROM received_reports WHERE operator=?1 AND request_id=?2",
+                params![operator, id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())
     }
     pub fn history_usage(&self, operator: &str) -> Result<serde_json::Value> {
         self.0.lock().unwrap().query_row("SELECT count(*),coalesce(sum(length(CAST(report AS BLOB))),0) FROM received_reports WHERE operator=?1",[operator],|r|Ok(serde_json::json!({"audits":r.get::<_,u64>(0)?,"files":r.get::<_,u64>(0)?,"bytes":r.get::<_,u64>(1)?}))).map_err(|e|e.to_string())

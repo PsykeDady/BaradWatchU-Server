@@ -146,6 +146,10 @@ pub fn application(app: Arc<App>) -> Router {
             axum::routing::delete(remove_requirement),
         )
         .route("/api/clients/{id}", axum::routing::delete(remove_client))
+        .route(
+            "/api/clients/{id}/executable-sha",
+            axum::routing::put(save_client_executable_sha).delete(clear_client_executable_sha),
+        )
         .route("/api/clients/{id}/requests", post(create_request))
         .route("/api/requests", get(list_requests))
         .route("/api/requests/{id}", get(request_status))
@@ -163,6 +167,10 @@ pub fn application(app: Arc<App>) -> Router {
             get(expected_manifest)
                 .put(save_expected_manifest)
                 .delete(remove_expected_manifest),
+        )
+        .route(
+            "/api/expected-manifest/sha-override",
+            axum::routing::put(save_manifest_sha_override).delete(clear_manifest_sha_override),
         )
         .route(
             "/api/requirement-definitions",
@@ -448,10 +456,11 @@ async fn generate(
 async fn clients(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult {
     admin(&app, &headers)?;
     let clients: Vec<Value> = app.store.clients().map_err(unavailable)?.into_iter().map(|client| {
+        let (imported_sha256,override_sha256)=app.store.client_executable_sha(&client.id).map_err(unavailable)?;
         let connected = app.tunnels.connected(&client.id);
         let reported_name = app.tunnels.reported_name(&client.id);
-        json!({"id":client.id,"name":client.name,"publicKey":client.public_key,"fingerprint":client.fingerprint,"connected":connected,"reportedName":reported_name})
-    }).collect();
+        Ok(json!({"id":client.id,"name":client.name,"publicKey":client.public_key,"fingerprint":client.fingerprint,"connected":connected,"reportedName":reported_name,"importedSha256":imported_sha256,"overrideSha256":override_sha256}))
+    }).collect::<Result<_,ApiError>>()?;
     Ok(Json(clients).into_response())
 }
 #[derive(Deserialize)]
@@ -471,7 +480,39 @@ async fn import_client(
         .store
         .import(body.identity, &body.name, &body.confirm_fingerprint)
         .map_err(bad)?;
-    Ok(Json(json!({"id":client.id,"name":client.name,"publicKey":client.public_key,"fingerprint":client.fingerprint,"connected":false})).into_response())
+    let (imported_sha256, override_sha256) = app
+        .store
+        .client_executable_sha(&client.id)
+        .map_err(unavailable)?;
+    Ok(Json(json!({"id":client.id,"name":client.name,"publicKey":client.public_key,"fingerprint":client.fingerprint,"connected":false,"importedSha256":imported_sha256,"overrideSha256":override_sha256})).into_response())
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ShaInput {
+    sha256: String,
+}
+async fn save_client_executable_sha(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<ShaInput>,
+) -> ApiResult {
+    mutation(&app, &headers)?;
+    app.store
+        .set_client_executable_sha_override(&id, Some(&body.sha256))
+        .map_err(bad)?;
+    Ok(Json(json!({"ok":true})).into_response())
+}
+async fn clear_client_executable_sha(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> ApiResult {
+    mutation(&app, &headers)?;
+    app.store
+        .set_client_executable_sha_override(&id, None)
+        .map_err(bad)?;
+    Ok(Json(json!({"ok":true})).into_response())
 }
 async fn remove_client(
     State(app): State<Arc<App>>,
@@ -761,7 +802,7 @@ async fn forward(
         app.store
             .remember_report(&r.operator_id, id, &r.client, &reply.body["report"])
             .map_err(unavailable)?;
-        reply.body["serverRequirementComparison"] = comparison(app, &report)?;
+        reply.body["serverRequirementComparison"] = comparison(app, &report, &r.client.id)?;
     }
     Ok((
         StatusCode::from_u16(reply.code).map_err(|_| unavailable("invalid remote HTTP status"))?,
@@ -1603,7 +1644,27 @@ async fn expected_manifest(State(app): State<Arc<App>>, headers: HeaderMap) -> A
         .as_deref()
         .map(|text| (text, "configured"))
         .unwrap_or((crate::manifest::default_text(), "bundled"));
-    Ok(Json(crate::manifest::view(text, source).map_err(unavailable)?).into_response())
+    let mut view = crate::manifest::view(text, source).map_err(unavailable)?;
+    view["overrideSha256"] = json!(app.store.manifest_sha_override().map_err(unavailable)?);
+    Ok(Json(view).into_response())
+}
+async fn save_manifest_sha_override(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Json(body): Json<ShaInput>,
+) -> ApiResult {
+    mutation(&app, &headers)?;
+    app.store
+        .set_manifest_sha_override(Some(&body.sha256))
+        .map_err(bad)?;
+    Ok(Json(json!({"ok":true})).into_response())
+}
+async fn clear_manifest_sha_override(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult {
+    mutation(&app, &headers)?;
+    app.store
+        .set_manifest_sha_override(None)
+        .map_err(unavailable)?;
+    Ok(Json(json!({"ok":true})).into_response())
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1628,7 +1689,11 @@ async fn remove_expected_manifest(State(app): State<Arc<App>>, headers: HeaderMa
     .into_response())
 }
 
-fn comparison(app: &App, report: &crate::report::AuditReport) -> Result<Value, ApiError> {
+fn comparison(
+    app: &App,
+    report: &crate::report::AuditReport,
+    client_id: &str,
+) -> Result<Value, ApiError> {
     let mut result = crate::report_integrity::inspect(
         report,
         &app.store.requirement_baselines().map_err(unavailable)?,
@@ -1638,7 +1703,23 @@ fn comparison(app: &App, report: &crate::report::AuditReport) -> Result<Value, A
         .expected_manifest()
         .map_err(unavailable)?
         .unwrap_or_else(|| crate::manifest::default_text().to_owned());
-    result["manifest"] = crate::manifest::compare(&manifest, report).map_err(unavailable)?;
+    let manifest_sha_override = app.store.manifest_sha_override().map_err(unavailable)?;
+    result["manifest"] =
+        crate::manifest::compare_with_digest(&manifest, manifest_sha_override.as_deref(), report)
+            .map_err(unavailable)?;
+    let (imported_sha, override_sha) = app
+        .store
+        .client_executable_sha(client_id)
+        .map_err(unavailable)?;
+    let expected_sha = override_sha.as_ref().or(imported_sha.as_ref());
+    let reported_sha = report.client.sha256.as_deref();
+    let state = match (expected_sha, reported_sha) {
+        (None, _) => "UNKNOWN",
+        (Some(_), None) => "MISSING",
+        (Some(expected), Some(reported)) if expected.eq_ignore_ascii_case(reported) => "MATCH",
+        _ => "MISMATCH",
+    };
+    result["clientExecutable"] = json!({"state":state,"expectedSha256":expected_sha,"reportedSha256":reported_sha,"source":if override_sha.is_some(){"override"}else if imported_sha.is_some(){"identity"}else{"unknown"}});
     result["definitions"] = json!(app
         .store
         .requirement_definitions()
@@ -1675,10 +1756,16 @@ async fn history_report(
 ) -> ApiResult {
     let report = saved_report(&app, &headers, &id)?;
     let parsed = crate::report_integrity::parse(&report).map_err(unavailable)?;
-    Ok(
-        Json(json!({"report":report,"serverRequirementComparison":comparison(&app,&parsed)?}))
-            .into_response(),
+    let s = admin(&app, &headers)?;
+    let client_id = app
+        .store
+        .history_client_id(&s.operator.id, &id)
+        .map_err(unavailable)?
+        .ok_or(ApiError(StatusCode::NOT_FOUND, "REPORT_NOT_FOUND".into()))?;
+    Ok(Json(
+        json!({"report":report,"serverRequirementComparison":comparison(&app,&parsed,&client_id)?}),
     )
+    .into_response())
 }
 async fn history_pdf(
     State(app): State<Arc<App>>,

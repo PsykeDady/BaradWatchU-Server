@@ -93,17 +93,27 @@ pub fn view(text: &str, source: &str) -> Result<Value, String> {
     }))
 }
 pub fn compare(text: &str, report: &AuditReport) -> Result<Value, String> {
+    compare_with_digest(text, None, report)
+}
+pub fn compare_with_digest(
+    text: &str,
+    digest_override: Option<&str>,
+    report: &AuditReport,
+) -> Result<Value, String> {
     let entries = parse(text)?;
     let Some(installation) = &report.installation else {
         return Ok(json!({"state":"UNKNOWN","manifestState":"UNKNOWN","files":[]}));
     };
+    let expected_digest = digest_override
+        .map(str::to_owned)
+        .unwrap_or_else(|| digest(text));
     let expected: Vec<_> = entries
         .iter()
         .filter(|e| e.platform == installation.platform)
         .collect();
     if expected.is_empty() {
         return Ok(
-            json!({"state":"UNKNOWN","manifestState":"UNKNOWN","files":[],"platform":installation.platform}),
+            json!({"state":"UNKNOWN","manifestState":"UNKNOWN","expectedManifestSha256":expected_digest,"reportedManifestSha256":installation.manifest_sha256,"files":[],"platform":installation.platform}),
         );
     }
     let mut seen = BTreeMap::new();
@@ -142,7 +152,7 @@ pub fn compare(text: &str, report: &AuditReport) -> Result<Value, String> {
     for file in seen.values() {
         files.push(json!({"id":file.requirement_id,"path":file.path,"state":"UNEXPECTED","declaredExpectationState":"UNKNOWN"}));
     }
-    let manifest_state = if digest(text).eq_ignore_ascii_case(&installation.manifest_sha256) {
+    let manifest_state = if expected_digest.eq_ignore_ascii_case(&installation.manifest_sha256) {
         "MATCH"
     } else {
         "MISMATCH"
@@ -167,7 +177,7 @@ pub fn compare(text: &str, report: &AuditReport) -> Result<Value, String> {
         "UNVERIFIED"
     };
     Ok(
-        json!({"state":state,"manifestState":manifest_state,"expectedManifestSha256":digest(text),"reportedManifestSha256":installation.manifest_sha256,"platform":installation.platform,"files":files}),
+        json!({"state":state,"manifestState":manifest_state,"expectedManifestSha256":expected_digest,"reportedManifestSha256":installation.manifest_sha256,"platform":installation.platform,"files":files}),
     )
 }
 
