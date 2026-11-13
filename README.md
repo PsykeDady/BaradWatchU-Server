@@ -276,9 +276,10 @@ The Settings language selector persists `system`, `italian` or `english` in the 
 ### Client catalog, Server expectations and custom checks
 
 The Server binary bundles the paired Client release's `catalog/builtin-tools.sha256`,
-configurations and tool sources for Linux and Windows. This is the default expected catalog
+configurations and tool sources for Linux, Windows and macOS (manifest platforms `linux`,
+`windows`, `macos`, folders `checks`, `checks-windows`, `checks-macos`). This is the default expected catalog
 and is shown on the Requirements page with the paired Client version. The bundled manifest
-digest is `4d4ddfb5a3b3db91adef6061acaaa0f9d8b83583c5cc4be3eb4198fef4dc3aeb`. Administrators can replace it
+digest is `45918aceff1549dfb53c1634fc0ff48c3b9e8ef8f81d83697f6b67f7a0d6bb92`. Administrators can replace it
 with the exact manifest from a newer verified Client package; that fleet-wide override is
 stored in SQLite and takes effect without reinstalling the Server. In the Requirements page,
 the active `builtin-tools.sha256` is shown read-only; replacing it requires selecting a file

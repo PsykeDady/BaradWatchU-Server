@@ -282,9 +282,10 @@ Il selettore lingua nelle Impostazioni salva `system`, `italian` o `english` nel
 ### Catalogo Client, aspettative Server e controlli personalizzati
 
 Il binario Server include `catalog/builtin-tools.sha256`, configurazioni e sorgenti dei tool
-Client abbinati per Linux e Windows. È il catalogo atteso predefinito e compare nella scheda
+Client abbinati per Linux, Windows e macOS (piattaforme del manifest `linux`, `windows`,
+`macos`, cartelle `checks`, `checks-windows`, `checks-macos`). È il catalogo atteso predefinito e compare nella scheda
 Requisiti con la versione Client abbinata. Il digest completo è mostrato nella dashboard;
-quello del manifest incluso è `4d4ddfb5a3b3db91adef6061acaaa0f9d8b83583c5cc4be3eb4198fef4dc3aeb`.
+quello del manifest incluso è `45918aceff1549dfb53c1634fc0ff48c3b9e8ef8f81d83697f6b67f7a0d6bb92`.
 Gli amministratori possono sostituire il manifest con quello di un pacchetto Client più
 recente e verificato; la modifica per tutta la flotta viene salvata in SQLite e non richiede
 la reinstallazione del Server. Nella scheda Requisiti il manifest attivo `builtin-tools.sha256`

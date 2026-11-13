@@ -37,10 +37,11 @@ pub fn parse(text: &str) -> Result<Vec<Entry>, String> {
             return Err(format!("invalid manifest line {}", index + 1));
         }
         let [id, platform, path, hash] = [f[0], f[1], f[2], f[3]];
-        let folder = if platform == "windows" {
-            "checks-windows"
-        } else {
-            "checks"
+        // Client catalog folder of each platform (see the Client's build.rs).
+        let folder = match platform {
+            "windows" => "checks-windows",
+            "macos" => "checks-macos",
+            _ => "checks",
         };
         let prefix = format!("catalog/{folder}/{id}/");
         if !id.starts_with("REQ-")
@@ -49,7 +50,7 @@ pub fn parse(text: &str) -> Result<Vec<Entry>, String> {
             || !id
                 .bytes()
                 .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'-')
-            || !matches!(platform, "linux" | "windows")
+            || !matches!(platform, "linux" | "windows" | "macos")
             || !path.starts_with(&prefix)
             || path.len() <= prefix.len()
             || path.contains('\\')
@@ -258,5 +259,30 @@ mod tests {
         assert_eq!(result["files"][0]["state"], "MATCH");
         report.installation.as_mut().unwrap().platform = "windows".into();
         assert_eq!(compare(FIXTURE, &report).unwrap()["state"], "UNVERIFIED");
+    }
+    #[test]
+    fn macos_lines_use_their_own_catalog_folder() {
+        let entries = parse(FIXTURE).unwrap();
+        let macos = entries
+            .iter()
+            .filter(|entry| entry.platform == "macos")
+            .collect::<Vec<_>>();
+        assert!(!macos.is_empty());
+        assert!(macos.iter().all(|entry| entry
+            .path
+            .starts_with(&format!("catalog/checks-macos/{}/", entry.requirement))));
+        let hash = "a".repeat(64);
+        assert!(parse(&format!(
+            "REQ-001 macos catalog/checks-macos/REQ-001/check.sh {hash}\n"
+        ))
+        .is_ok());
+        assert!(parse(&format!(
+            "REQ-001 macos catalog/checks/REQ-001/check.sh {hash}\n"
+        ))
+        .is_err());
+        // A macOS report is compared with the macOS lines only, file by file.
+        let text = format!("REQ-001 macos catalog/checks-macos/REQ-001/check.sh {hash}\n");
+        let report: AuditReport = serde_json::from_value(json!({"schemaVersion":"baradwatchu.audit.v1","completedAtUnixMs":1,"results":[],"installation":{"status":"VERIFIED","platform":"macos","manifestSha256":digest(&text),"verifiedFiles":1,"files":[{"requirementId":"REQ-001","path":"catalog/checks-macos/REQ-001/check.sh","expectedSha256":hash,"actualSha256":hash,"state":"VERIFIED"}]}})).unwrap();
+        assert_eq!(compare(&text, &report).unwrap()["state"], "MATCH");
     }
 }

@@ -60,7 +60,8 @@ pub fn read_session(dir: &Path) -> Option<Session> {
     (session.schema_version == SESSION_SCHEMA && valid_token(&session.token)).then_some(session)
 }
 
-/// Reused only if the port accepts connections and, on Linux, the PID runs this executable.
+/// Reused only if the port accepts connections and, on Linux and macOS, the PID runs this
+/// executable.
 pub fn session_alive(session: &Session) -> bool {
     let address = std::net::SocketAddr::from(([127, 0, 0, 1], session.port));
     if TcpStream::connect_timeout(&address, Duration::from_millis(500)).is_err() {
@@ -72,6 +73,28 @@ pub fn session_alive(session: &Session) -> bool {
             return false;
         };
         return fs::read_link(format!("/proc/{}/exe", session.pid)).is_ok_and(|exe| exe == current);
+    }
+    // macOS has no /proc: same check through proc_pidpath (Client dashboard.rs/events.rs).
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(current) = std::env::current_exe().and_then(|p| p.canonicalize()) else {
+            return false;
+        };
+        let Ok(pid) = libc::c_int::try_from(session.pid) else {
+            return false;
+        };
+        let mut buffer = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        // SAFETY: the buffer is writable and its exact size is passed to the kernel.
+        let length =
+            unsafe { libc::proc_pidpath(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
+        let Some(length) = usize::try_from(length).ok().filter(|length| *length > 0) else {
+            return false;
+        };
+        buffer.truncate(length);
+        return Path::new(std::ffi::OsStr::from_bytes(&buffer))
+            .canonicalize()
+            .is_ok_and(|exe| exe == current);
     }
     #[allow(unreachable_code)]
     true
