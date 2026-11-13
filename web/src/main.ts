@@ -54,7 +54,7 @@ const SEVERITY:Record<string,number>={ERROR:0,FAIL:1,WARN:2,PENDING:3,PASS:4,NOT
         <article class="requirement-card" *ngFor="let id of visibleRequirementIds()">
           <div class="requirement-head"><div class="requirement-title"><div class="tags"><span class="requirement-id">{{id}}</span><span class="priority" [attr.data-priority]="t('requirement.'+id+'.priority')">{{t('priority.'+t('requirement.'+id+'.priority'))}}</span></div><h3>{{t('requirement.'+id+'.name')}}</h3></div></div>
           <details class="requirement-details"><summary><span>{{t('requirementDetails')}}</span><span class="chevron" aria-hidden="true">⌄</span></summary>
-            <div class="detail-content"><p class="description">{{t('requirement.'+id+'.description')}}</p><p *ngIf="hasWindowsDescription(id)" class="description"><strong>Windows:</strong> {{t('requirement.'+id+'.windowsDescription')}}</p>
+            <div class="detail-content"><p class="description">{{t('requirement.'+id+'.description')}}</p><p *ngIf="hasWindowsDescription(id)" class="description"><strong>Windows:</strong> {{t('requirement.'+id+'.windowsDescription')}}</p><p *ngIf="hasMacosDescription(id)" class="description"><strong>macOS:</strong> {{t('requirement.'+id+'.macosDescription')}}</p>
               <details class="technical"><summary>{{t('technicalDetails')}}</summary><dl class="facts"><ng-container *ngFor="let file of requirementFiles(id)"><dt>{{t('clientToolFiles')}} · {{file.platform}}</dt><dd><code>{{file.path}}</code></dd><dt>{{t('expectedSha')}}</dt><dd><code>{{file.sha256}}</code></dd></ng-container></dl></details>
             </div>
           </details>
@@ -110,6 +110,7 @@ class AppComponent implements OnInit, OnDestroy {
   async clearHistory():Promise<void>{if(!confirm(this.t('confirmClearHistory')))return;await this.action(async()=>{await this.api('/api/history','DELETE');this.historyId='';this.historyReport=null;this.historyComparison=null;await this.loadHistory();});}
   statusText(value?:string):string{return this.messages['server.status.'+value]||value||this.t('status.UNKNOWN');}
   hasWindowsDescription(id:string):boolean{return id!=='REQ-007';}
+  hasMacosDescription(id:string):boolean{return ['REQ-001','REQ-002','REQ-003','REQ-006','REQ-008','REQ-009'].includes(id);}
   reportCount(report:Report,status:string):number{return report.results.filter(result=>result.status===status).length;}
   filteredResults(report:Report):Finding[]{const term=this.reportSearch.trim().toLowerCase();return report.results.filter(result=>(!this.reportFilter||result.status===this.reportFilter)&&(!term||`${result.id} ${result.name}`.toLowerCase().includes(term))).sort((a,b)=>(SEVERITY[a.status]??9)-(SEVERITY[b.status]??9));}   clearReportFilters():void{this.reportFilter=null;this.reportSearch='';}
   setReportFilter(status:string|null):void{this.reportFilter=this.reportFilter===status?null:status;}
