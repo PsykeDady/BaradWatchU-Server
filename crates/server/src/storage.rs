@@ -139,6 +139,10 @@ pub struct Operator {
     pub email: String,
 }
 pub struct Store(Mutex<Connection>);
+
+/// Owner of the automatic change reports sent by Clients under their Barad Policy (not an
+/// operator ID: those are `LOCAL` or `issuer:subject`).
+pub const CLIENT_REPORTS: &str = "@client";
 impl Store {
     pub fn open(dir: &Path) -> Result<Self> {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -183,7 +187,9 @@ CREATE TABLE IF NOT EXISTS manifest_sha_override (singleton INTEGER PRIMARY KEY 
 CREATE TABLE IF NOT EXISTS client_executable_sha (client_id TEXT PRIMARY KEY REFERENCES clients(id) ON DELETE CASCADE, imported_sha256 TEXT, override_sha256 TEXT);
 CREATE TABLE IF NOT EXISTS requirement_definitions (id TEXT PRIMARY KEY, configuration TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS requirement_baselines (id TEXT PRIMARY KEY, name TEXT NOT NULL, expected_sha256 TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1);
-CREATE TABLE IF NOT EXISTS server_custom_checks (id TEXT PRIMARY KEY, package TEXT NOT NULL);").map_err(|e|e.to_string())?;
+CREATE TABLE IF NOT EXISTS server_custom_checks (id TEXT PRIMARY KEY, package TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS client_policy_sha (client_id TEXT PRIMARY KEY REFERENCES clients(id) ON DELETE CASCADE, expected_sha256 TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS policy_sha_default (singleton INTEGER PRIMARY KEY CHECK(singleton=1), sha256 TEXT NOT NULL);").map_err(|e|e.to_string())?;
         let has_endpoint = {
             let mut statement = c
                 .prepare("PRAGMA table_info(clients)")
@@ -286,6 +292,64 @@ CREATE TABLE IF NOT EXISTS server_custom_checks (id TEXT PRIMARY KEY, package TE
                 .execute("DELETE FROM manifest_sha_override", [])
                 .map_err(|e| e.to_string())?;
         }
+        Ok(())
+    }
+    /// Barad Policy SHA-256 expected for every Client without its own expectation.
+    pub fn policy_sha_default(&self) -> Result<Option<String>> {
+        self.0
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT sha256 FROM policy_sha_default WHERE singleton=1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+    }
+    pub fn set_policy_sha_default(&self, sha: Option<&str>) -> Result<()> {
+        let db = self.0.lock().unwrap();
+        match sha {
+            Some(value) if valid_sha256(value) => db.execute("INSERT INTO policy_sha_default(singleton,sha256) VALUES(1,?1) ON CONFLICT(singleton) DO UPDATE SET sha256=excluded.sha256",[value.to_ascii_lowercase()]),
+            Some(_) => return Err("invalid Barad Policy SHA-256".into()),
+            None => db.execute("DELETE FROM policy_sha_default", []),
+        }
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    /// Barad Policy SHA-256 expected for one Client (set by an administrator, never learned).
+    pub fn client_policy_sha(&self, id: &str) -> Result<Option<String>> {
+        self.0
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT expected_sha256 FROM client_policy_sha WHERE client_id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+    }
+    pub fn set_client_policy_sha(&self, id: &str, sha: Option<&str>) -> Result<()> {
+        if sha.is_some_and(|value| !valid_sha256(value)) {
+            return Err("invalid Barad Policy SHA-256".into());
+        }
+        let db = self.0.lock().unwrap();
+        let exists: bool = db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM clients WHERE id=?1)",
+                [id],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if !exists {
+            return Err("CLIENT_NOT_REGISTERED".into());
+        }
+        match sha {
+            Some(value) => db.execute("INSERT INTO client_policy_sha(client_id,expected_sha256) VALUES(?1,?2) ON CONFLICT(client_id) DO UPDATE SET expected_sha256=excluded.expected_sha256",params![id,value.to_ascii_lowercase()]),
+            None => db.execute("DELETE FROM client_policy_sha WHERE client_id=?1", [id]),
+        }
+        .map_err(|e| e.to_string())?;
         Ok(())
     }
     pub fn client_executable_sha(&self, id: &str) -> Result<(Option<String>, Option<String>)> {
@@ -696,10 +760,12 @@ impl Store {
         c.execute("INSERT INTO received_reports(operator,request_id,client_id,client_name,fingerprint,completed,report) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![operator,request_id,client.id,client.name,client.fingerprint,parsed.completed_at_unix_ms,text]).map_err(|e|e.to_string())?;
         Ok(())
     }
+    /// The operator's own received reports plus the Clients' automatic change reports, which
+    /// belong to the fleet and are visible to every authorized administrator.
     pub fn history(&self, operator: &str) -> Result<Vec<serde_json::Value>> {
         let c = self.0.lock().unwrap();
-        let mut q=c.prepare("SELECT request_id,client_id,client_name,fingerprint,completed,length(CAST(report AS BLOB)) FROM received_reports WHERE operator=?1 ORDER BY completed DESC,request_id").map_err(|e|e.to_string())?;
-        let rows=q.query_map([operator],|r|Ok(serde_json::json!({"id":r.get::<_,String>(0)?,"clientId":r.get::<_,String>(1)?,"clientName":r.get::<_,String>(2)?,"fingerprint":r.get::<_,String>(3)?,"completedAtUnixMs":r.get::<_,u64>(4)?,"files":1,"bytes":r.get::<_,u64>(5)?}))).map_err(|e|e.to_string())?;
+        let mut q=c.prepare("SELECT request_id,client_id,client_name,fingerprint,completed,length(CAST(report AS BLOB)),operator=?2 FROM received_reports WHERE (operator=?1 OR operator=?2) ORDER BY completed DESC,request_id").map_err(|e|e.to_string())?;
+        let rows=q.query_map([operator,CLIENT_REPORTS],|r|Ok(serde_json::json!({"id":r.get::<_,String>(0)?,"clientId":r.get::<_,String>(1)?,"clientName":r.get::<_,String>(2)?,"fingerprint":r.get::<_,String>(3)?,"completedAtUnixMs":r.get::<_,u64>(4)?,"files":1,"bytes":r.get::<_,u64>(5)?,"automatic":r.get::<_,bool>(6)?}))).map_err(|e|e.to_string())?;
         rows.collect::<std::result::Result<_, _>>()
             .map_err(|e| e.to_string())
     }
@@ -709,8 +775,8 @@ impl Store {
             .lock()
             .unwrap()
             .query_row(
-                "SELECT report FROM received_reports WHERE operator=?1 AND request_id=?2",
-                params![operator, id],
+                "SELECT report FROM received_reports WHERE (operator=?1 OR operator=?3) AND request_id=?2 ORDER BY operator=?3 LIMIT 1",
+                params![operator, id, CLIENT_REPORTS],
                 |r| r.get(0),
             )
             .optional()
@@ -723,26 +789,26 @@ impl Store {
             .lock()
             .unwrap()
             .query_row(
-                "SELECT client_id FROM received_reports WHERE operator=?1 AND request_id=?2",
-                params![operator, id],
+                "SELECT client_id FROM received_reports WHERE (operator=?1 OR operator=?3) AND request_id=?2 ORDER BY operator=?3 LIMIT 1",
+                params![operator, id, CLIENT_REPORTS],
                 |r| r.get(0),
             )
             .optional()
             .map_err(|e| e.to_string())
     }
     pub fn history_usage(&self, operator: &str) -> Result<serde_json::Value> {
-        self.0.lock().unwrap().query_row("SELECT count(*),coalesce(sum(length(CAST(report AS BLOB))),0) FROM received_reports WHERE operator=?1",[operator],|r|Ok(serde_json::json!({"audits":r.get::<_,u64>(0)?,"files":r.get::<_,u64>(0)?,"bytes":r.get::<_,u64>(1)?}))).map_err(|e|e.to_string())
+        self.0.lock().unwrap().query_row("SELECT count(*),coalesce(sum(length(CAST(report AS BLOB))),0) FROM received_reports WHERE (operator=?1 OR operator=?2)",[operator,CLIENT_REPORTS],|r|Ok(serde_json::json!({"audits":r.get::<_,u64>(0)?,"files":r.get::<_,u64>(0)?,"bytes":r.get::<_,u64>(1)?}))).map_err(|e|e.to_string())
     }
     pub fn remove_history(&self, operator: &str, id: Option<&str>) -> Result<serde_json::Value> {
         let mut c = self.0.lock().unwrap();
         let tx = c.transaction().map_err(|e| e.to_string())?;
-        let (count,bytes):(u64,u64)=tx.query_row("SELECT count(*),coalesce(sum(length(CAST(report AS BLOB))),0) FROM received_reports WHERE operator=?1 AND (?2 IS NULL OR request_id=?2)",params![operator,id],|r|Ok((r.get(0)?,r.get(1)?))).map_err(|e|e.to_string())?;
+        let (count,bytes):(u64,u64)=tx.query_row("SELECT count(*),coalesce(sum(length(CAST(report AS BLOB))),0) FROM received_reports WHERE (operator=?1 OR operator=?3) AND (?2 IS NULL OR request_id=?2)",params![operator,id,CLIENT_REPORTS],|r|Ok((r.get(0)?,r.get(1)?))).map_err(|e|e.to_string())?;
         tx.execute(
-            "DELETE FROM received_reports WHERE operator=?1 AND (?2 IS NULL OR request_id=?2)",
-            params![operator, id],
+            "DELETE FROM received_reports WHERE (operator=?1 OR operator=?3) AND (?2 IS NULL OR request_id=?2)",
+            params![operator, id, CLIENT_REPORTS],
         )
         .map_err(|e| e.to_string())?;
-        let usage=tx.query_row("SELECT count(*),coalesce(sum(length(CAST(report AS BLOB))),0) FROM received_reports WHERE operator=?1",[operator],|r|Ok(serde_json::json!({"audits":r.get::<_,u64>(0)?,"files":r.get::<_,u64>(0)?,"bytes":r.get::<_,u64>(1)?}))).map_err(|e|e.to_string())?;
+        let usage=tx.query_row("SELECT count(*),coalesce(sum(length(CAST(report AS BLOB))),0) FROM received_reports WHERE (operator=?1 OR operator=?2)",[operator,CLIENT_REPORTS],|r|Ok(serde_json::json!({"audits":r.get::<_,u64>(0)?,"files":r.get::<_,u64>(0)?,"bytes":r.get::<_,u64>(1)?}))).map_err(|e|e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(
             serde_json::json!({"removedAudits":count,"removedFiles":count,"freedBytes":bytes,"usage":usage}),
@@ -764,6 +830,73 @@ mod history_tests {
     }
     fn report() -> serde_json::Value {
         json!({"schemaVersion":"baradwatchu.audit.v1","completedAtUnixMs":123,"results":[],"futureExtension":{"original":true}})
+    }
+    #[test]
+    fn automatic_client_reports_are_shared_while_requested_ones_stay_private() {
+        let store = Store::memory();
+        store
+            .remember_report("alice", "request", &client(), &report())
+            .unwrap();
+        store
+            .remember_report(CLIENT_REPORTS, "auto-1", &client(), &report())
+            .unwrap();
+        let bob = store.history("bob").unwrap();
+        assert_eq!(bob.len(), 1);
+        assert_eq!(
+            (bob[0]["id"].as_str(), bob[0]["automatic"].as_bool()),
+            (Some("auto-1"), Some(true))
+        );
+        let alice = store.history("alice").unwrap();
+        assert_eq!(alice.len(), 2);
+        assert!(alice
+            .iter()
+            .any(|row| row["id"] == "request" && row["automatic"] == false));
+        assert_eq!(
+            store.history_client_id("bob", "auto-1").unwrap().as_deref(),
+            Some("BWU-test")
+        );
+        assert!(store.history_report("bob", "request").unwrap().is_none());
+        assert_eq!(store.history_usage("bob").unwrap()["audits"], 1);
+        assert_eq!(
+            store.remove_history("bob", Some("auto-1")).unwrap()["removedAudits"],
+            1
+        );
+        assert_eq!(store.history("alice").unwrap().len(), 1);
+    }
+    #[test]
+    fn policy_expectations_are_validated_per_client_and_for_the_fleet() {
+        use ed25519_dalek::SigningKey;
+        let store = Store::memory();
+        store.generate("Server").unwrap();
+        let key = SigningKey::from_bytes(&[5; 32]).verifying_key().to_bytes();
+        let identity = PublicIdentity {
+            schema_version: "baradwatchu.public-identity.v1".into(),
+            role: "client".into(),
+            algorithm: "Ed25519".into(),
+            public_key: STANDARD.encode(key),
+            id: None,
+            name: None,
+            fingerprint: None,
+            created_at_unix_ms: None,
+            executable_sha256: None,
+        };
+        let id = store.import(identity, "PC", &fingerprint(&key)).unwrap().id;
+        assert!(store.set_client_policy_sha(&id, Some("nothex")).is_err());
+        assert!(store
+            .set_client_policy_sha("BWU-NONE", Some(&"a".repeat(64)))
+            .is_err());
+        store
+            .set_client_policy_sha(&id, Some(&"A".repeat(64)))
+            .unwrap();
+        assert_eq!(store.client_policy_sha(&id).unwrap(), Some("a".repeat(64)));
+        store.set_policy_sha_default(Some(&"b".repeat(64))).unwrap();
+        assert_eq!(store.policy_sha_default().unwrap(), Some("b".repeat(64)));
+        assert!(store.set_policy_sha_default(Some("short")).is_err());
+        // Removing trust removes that Client's expectation; the fleet one stays.
+        store.remove_client(&id).unwrap();
+        assert!(store.client_policy_sha(&id).unwrap().is_none());
+        store.set_policy_sha_default(None).unwrap();
+        assert!(store.policy_sha_default().unwrap().is_none());
     }
     #[test]
     fn history_is_scoped_to_operator_and_preserves_received_json() {

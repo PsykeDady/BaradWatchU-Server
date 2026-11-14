@@ -115,6 +115,21 @@ pub enum AuditInitiator {
         server_trusted_name: String,
         server_fingerprint: String,
     },
+    /// Periodic audit started by the Client service under its local Barad Policy.
+    Scheduled,
+}
+
+/// Barad Policy reported by the Client (state and SHA-256 of the bytes it read).
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PolicyReport {
+    pub state: String,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -137,6 +152,9 @@ pub struct AuditReport {
     /// agent, computed at audit time (for the Server's installation check). Older reports omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub installation: Option<InstallationIntegrity>,
+    /// Barad Policy state and SHA-256 (Client 2026-11 and later). Older reports omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<PolicyReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_file: Option<String>,
 }

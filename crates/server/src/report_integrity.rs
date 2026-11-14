@@ -135,6 +135,39 @@ pub fn inspect(report: &AuditReport, baselines: &[RequirementBaseline]) -> Value
     json!({"source":"Client observations authenticated by mTLS; SHA coherence is not proof of execution or a report signature.","coherence":if !issues.is_empty(){"INCONSISTENT"}else if report.installation.is_none()&&report.results.iter().all(|r|r.provenance.is_none()){"UNKNOWN"}else{"COHERENT"},"issues":issues,"items":items,"installationEvidenceAvailable":report.installation.is_some(),"provenanceAvailable":report.results.iter().all(|r|r.provenance.is_some())})
 }
 
+/// Barad Policy SHA-256 against the administrator's expectation for this Client (else the
+/// fleet expectation). MATCH requires a policy the Client reports as APPLIED with that digest;
+/// a missing, invalid or untrusted policy is a MISMATCH. Without an expectation: UNKNOWN.
+/// An integrity comparison of Client-reported evidence, not a signature.
+pub fn compare_policy(report: &AuditReport, client: Option<&str>, fleet: Option<&str>) -> Value {
+    let (expected, source) = match (client, fleet) {
+        (Some(sha), _) => (Some(sha), "client"),
+        (None, Some(sha)) => (Some(sha), "fleet"),
+        (None, None) => (None, "unknown"),
+    };
+    let policy = report.policy.as_ref();
+    let reported_state = policy.map_or("MISSING", |p| p.state.as_str());
+    let reported_sha = policy.and_then(|p| p.sha256.as_deref());
+    let state = match expected {
+        None => "UNKNOWN",
+        Some(expected)
+            if reported_state == "APPLIED"
+                && reported_sha.is_some_and(|sha| sha.eq_ignore_ascii_case(expected)) =>
+        {
+            "MATCH"
+        }
+        Some(_) => "MISMATCH",
+    };
+    serde_json::json!({
+        "state": state,
+        "expectedSha256": expected,
+        "reportedSha256": reported_sha,
+        "reportedState": reported_state,
+        "reportedError": policy.and_then(|p| p.error.as_deref()),
+        "source": source,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,6 +176,59 @@ mod tests {
     }
     fn provenance(value: &mut Value) {
         value["results"][0]["provenance"] = json!({"toolId":"REQ-001","origin":"BUILTIN","expectedSha256":"a".repeat(64),"actualSha256":"a".repeat(64),"integrityStatus":"VERIFIED","integrityScope":"CHECK_FOLDER","isOverride":false});
+    }
+    #[test]
+    fn barad_policy_sha_is_compared_only_with_an_administrator_expectation() {
+        let sha = "b".repeat(64);
+        let mut v = fixture();
+        v["policy"] =
+            json!({"state":"APPLIED","path":"/etc/baradwatchu/barad-policy.json","sha256":sha});
+        let applied = parse(&v).unwrap();
+        // No expectation: never learned from the report itself.
+        assert_eq!(compare_policy(&applied, None, None)["state"], "UNKNOWN");
+        assert_eq!(compare_policy(&applied, None, Some(&sha))["state"], "MATCH");
+        assert_eq!(
+            compare_policy(&applied, None, Some(&sha))["source"],
+            "fleet"
+        );
+        assert_eq!(
+            compare_policy(&applied, Some(&sha.to_uppercase()), None)["state"],
+            "MATCH"
+        );
+        // The per-Client expectation wins over the fleet one.
+        let other = "c".repeat(64);
+        let mismatch = compare_policy(&applied, Some(&other), Some(&sha));
+        assert_eq!(mismatch["state"], "MISMATCH");
+        assert_eq!(mismatch["source"], "client");
+        assert_eq!(mismatch["reportedSha256"], sha.as_str());
+        // Same bytes but not applied (untrusted owner or invalid): not a match.
+        v["policy"]["state"] = json!("UNTRUSTED");
+        assert_eq!(
+            compare_policy(&parse(&v).unwrap(), Some(&sha), None)["state"],
+            "MISMATCH"
+        );
+        // Policy removed, or a Client too old to report it.
+        v["policy"] = json!({"state":"ABSENT","path":"/etc/baradwatchu/barad-policy.json"});
+        assert_eq!(
+            compare_policy(&parse(&v).unwrap(), Some(&sha), None)["state"],
+            "MISMATCH"
+        );
+        let legacy = parse(&fixture()).unwrap();
+        let missing = compare_policy(&legacy, Some(&sha), None);
+        assert_eq!(
+            (missing["state"].as_str(), missing["reportedState"].as_str()),
+            (Some("MISMATCH"), Some("MISSING"))
+        );
+        assert_eq!(compare_policy(&legacy, None, None)["state"], "UNKNOWN");
+    }
+    #[test]
+    fn scheduled_initiator_is_part_of_the_contract() {
+        let mut v = fixture();
+        v["initiator"] = json!({"origin":"SCHEDULED"});
+        assert!(matches!(
+            parse(&v).unwrap().initiator,
+            Some(AuditInitiator::Scheduled)
+        ));
     }
     #[test]
     fn legacy_report_is_readable_but_missing_evidence_is_unknown() {

@@ -150,6 +150,16 @@ pub fn application(app: Arc<App>) -> Router {
             "/api/clients/{id}/executable-sha",
             axum::routing::put(save_client_executable_sha).delete(clear_client_executable_sha),
         )
+        .route(
+            "/api/clients/{id}/policy-sha",
+            axum::routing::put(save_client_policy_sha).delete(clear_client_policy_sha),
+        )
+        .route(
+            "/api/barad-policy/expected-sha",
+            get(policy_sha_default)
+                .put(save_policy_sha_default)
+                .delete(clear_policy_sha_default),
+        )
         .route("/api/clients/{id}/requests", post(create_request))
         .route("/api/requests", get(list_requests))
         .route("/api/requests/{id}", get(request_status))
@@ -457,9 +467,10 @@ async fn clients(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult {
     admin(&app, &headers)?;
     let clients: Vec<Value> = app.store.clients().map_err(unavailable)?.into_iter().map(|client| {
         let (imported_sha256,override_sha256)=app.store.client_executable_sha(&client.id).map_err(unavailable)?;
+        let policy_sha256=app.store.client_policy_sha(&client.id).map_err(unavailable)?;
         let connected = app.tunnels.connected(&client.id);
         let reported_name = app.tunnels.reported_name(&client.id);
-        Ok(json!({"id":client.id,"name":client.name,"publicKey":client.public_key,"fingerprint":client.fingerprint,"connected":connected,"reportedName":reported_name,"importedSha256":imported_sha256,"overrideSha256":override_sha256}))
+        Ok(json!({"id":client.id,"name":client.name,"publicKey":client.public_key,"fingerprint":client.fingerprint,"connected":connected,"reportedName":reported_name,"importedSha256":imported_sha256,"overrideSha256":override_sha256,"policySha256":policy_sha256}))
     }).collect::<Result<_,ApiError>>()?;
     Ok(Json(clients).into_response())
 }
@@ -512,6 +523,53 @@ async fn clear_client_executable_sha(
     app.store
         .set_client_executable_sha_override(&id, None)
         .map_err(bad)?;
+    Ok(Json(json!({"ok":true})).into_response())
+}
+/// Barad Policy baselines: entered by an administrator, never learned from a report.
+async fn save_client_policy_sha(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<ShaInput>,
+) -> ApiResult {
+    mutation(&app, &headers)?;
+    app.store
+        .set_client_policy_sha(&id, Some(&body.sha256))
+        .map_err(bad)?;
+    Ok(Json(json!({"ok":true})).into_response())
+}
+async fn clear_client_policy_sha(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> ApiResult {
+    mutation(&app, &headers)?;
+    app.store.set_client_policy_sha(&id, None).map_err(bad)?;
+    Ok(Json(json!({"ok":true})).into_response())
+}
+async fn policy_sha_default(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult {
+    admin(&app, &headers)?;
+    Ok(
+        Json(json!({"sha256": app.store.policy_sha_default().map_err(unavailable)?}))
+            .into_response(),
+    )
+}
+async fn save_policy_sha_default(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Json(body): Json<ShaInput>,
+) -> ApiResult {
+    mutation(&app, &headers)?;
+    app.store
+        .set_policy_sha_default(Some(&body.sha256))
+        .map_err(bad)?;
+    Ok(Json(json!({"ok":true})).into_response())
+}
+async fn clear_policy_sha_default(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult {
+    mutation(&app, &headers)?;
+    app.store
+        .set_policy_sha_default(None)
+        .map_err(unavailable)?;
     Ok(Json(json!({"ok":true})).into_response())
 }
 async fn remove_client(
@@ -1720,6 +1778,17 @@ fn comparison(
         _ => "MISMATCH",
     };
     result["clientExecutable"] = json!({"state":state,"expectedSha256":expected_sha,"reportedSha256":reported_sha,"source":if override_sha.is_some(){"override"}else if imported_sha.is_some(){"identity"}else{"unknown"}});
+    result["baradPolicy"] = crate::report_integrity::compare_policy(
+        report,
+        app.store
+            .client_policy_sha(client_id)
+            .map_err(unavailable)?
+            .as_deref(),
+        app.store
+            .policy_sha_default()
+            .map_err(unavailable)?
+            .as_deref(),
+    );
     result["definitions"] = json!(app
         .store
         .requirement_definitions()

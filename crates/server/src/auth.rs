@@ -325,7 +325,14 @@ fn process_operator_name() -> String {
         .into_iter()
         .filter_map(|key| std::env::var(key).ok())
         .find(|name| storage::label(name))
-        .unwrap_or_else(|| "Operatore locale".into())
+        // Generic label in the Server language (shared language preference).
+        .unwrap_or_else(|| {
+            baradwatchu_messages::message(
+                "server.localOperator",
+                baradwatchu_messages::configured_language(),
+            )
+            .to_owned()
+        })
 }
 #[derive(Deserialize)]
 struct GoogleClaims {

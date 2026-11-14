@@ -652,6 +652,7 @@ fn report_subtitle_key(report: &AuditReport) -> &'static str {
     match &report.initiator {
         Some(crate::report::AuditInitiator::Local) => "pdf.report_subtitle",
         Some(crate::report::AuditInitiator::Remote { .. }) => "pdf.report_subtitle_remote",
+        Some(crate::report::AuditInitiator::Scheduled) => "pdf.report_subtitle_scheduled",
         None => "pdf.report_subtitle_unknown",
     }
 }
@@ -885,6 +886,7 @@ fn draw_summary(
             server_display_name,
             server_id
         ),
+        Some(crate::report::AuditInitiator::Scheduled) => "SCHEDULED (Barad Policy)".to_owned(),
         None => baradwatchu_messages::message("pdf.origin_unknown", language).to_owned(),
     };
     for line in wrap(&attribution, 100) {

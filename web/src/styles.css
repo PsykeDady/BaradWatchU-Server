@@ -398,6 +398,8 @@ button.metric:hover { background: var(--neutral-bg); }
 .binary-alert { display:grid; gap:5px; margin:14px 0; padding:12px; color:#ffb4a6; background:var(--fail-bg); border:2px solid var(--fail); border-radius:8px; }
 .binary-alert[data-state="MATCH"] { color:var(--pass); background:var(--pass-bg); border-color:var(--pass); }
 .binary-alert code { overflow-wrap:anywhere; }
+/* Barad Policy without an administrator expectation: informative, not an alarm. */
+.policy-alert[data-state="UNKNOWN"] { color:var(--text-2); background:var(--surface-2); border-color:var(--line-strong); }
 .client small,.fingerprint,code { overflow-wrap:anywhere; }
 .server-panel button:not(.tab),a.button { min-height:40px; padding:8px 15px; border:1px solid var(--line-strong); border-radius:8px; color:var(--text); background:var(--surface-3); }
 .server-panel button:not(.secondary) { background:linear-gradient(180deg,var(--ember),var(--ember-deep)); color:#fff8ef; }

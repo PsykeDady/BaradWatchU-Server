@@ -37,6 +37,9 @@ pub struct CheckConfiguration {
     pub override_builtin_id: Option<String>,
     #[serde(default)]
     pub timeout_seconds: Option<u64>,
+    /// Client built-ins only: the tool may run elevated under the Client's Barad Policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub privilege_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -48,6 +51,9 @@ pub struct ProviderConfiguration {
     pub parameters: serde_json::Value,
     #[serde(default)]
     pub timeout_seconds: Option<u64>,
+    /// Client built-ins only: the tool may run elevated under the Client's Barad Policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub privilege_reason: Option<String>,
 }
 
 fn valid_provider_id(id: &str) -> bool {
@@ -339,6 +345,7 @@ mod tests {
                 tool_path: "./first.sh".into(),
                 parameters: json!({}),
                 timeout_seconds: Some(30),
+                privilege_reason: None,
             },
         );
         config.parameters = json!({"acceptedProviders":["missing"]});

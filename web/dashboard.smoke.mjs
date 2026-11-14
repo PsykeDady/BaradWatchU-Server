@@ -19,6 +19,7 @@ const server=http.createServer(async(req,res)=>{
   return send({language,effectiveLanguage:locale,messages:JSON.parse(readFileSync(new URL(`../crates/messages/locales/${locale}.json`,import.meta.url),'utf8')).messages});
  }
  if(req.url==='/api/expected-manifest')return send(null);
+ if(req.url==='/api/barad-policy/expected-sha')return send({sha256:'c'.repeat(64)});
  if(req.url==='/api/report-theme')return send({selectedThemeId:'default',themes:[{id:'default',name:'BaradWatchU'}]});
  if(req.url==='/api/requirement-definitions'){
   if(req.method==='POST'){assert.equal(req.headers['x-bwu-csrf'],'csrf');let b='';for await(const c of req)b+=c;const definition=JSON.parse(b);definitions=[definition];return send(definition);}
@@ -32,7 +33,7 @@ const server=http.createServer(async(req,res)=>{
  }
  if(id && req.url===`/api/history/${id}`){
   if(req.method==='DELETE'){assert.equal(req.headers['x-bwu-csrf'],'csrf');savedReport=null;return send({removedAudits:1});}
-  return send({report:savedReport,serverRequirementComparison:{source:'fixture',items:[]}});
+  return send({report:savedReport,serverRequirementComparison:{source:'fixture',items:[],baradPolicy:{state:'MISMATCH',expectedSha256:'c'.repeat(64),reportedSha256:'d'.repeat(64),reportedState:'APPLIED',source:'fleet'}}});
  }
  if(req.url==='/api/auth-mode')return send({mode:'LOCAL'});
  if(req.url==='/auth/logout'&&req.method==='POST'){assert.equal(req.headers['x-bwu-csrf'],'csrf');return send({ok:true});}
@@ -77,6 +78,7 @@ try{
  await evaluate("[...document.querySelectorAll('button')].find(b=>b.textContent.trim()==='Request audit').click()");
  for(const text of ['Waiting for consent','Audit running','Fixture audit completed'])await wait(`document.body.innerText.includes('${text}')`);
  assert.ok(await evaluate("document.body.innerText.includes('Requested by Mario Rossi')"));
+await wait("document.body.innerText.includes('Barad Policy SHA-256: Mismatch')");assert.equal(await evaluate("document.querySelector('.policy-alert').getAttribute('role')"),'alert','policy mismatch is an alert');assert.ok(await evaluate("document.body.innerText.includes('does not match the expectation')"));
  for(const text of ['Client version 0.0.1','Installation integrity','Checks the workstation baseline.','Execution provenance','Providers','Not in scope'])await wait(`document.body.innerText.includes('${text}')`);
  await evaluate("[...document.querySelectorAll('summary')].find(s=>s.textContent.trim()==='Providers').click()");await wait("document.body.innerText.includes('Fixture provider')");
  await evaluate("document.querySelector('.report-counts button[data-status=FAIL]').click()");assert.equal(await evaluate("document.body.innerText.includes('Checks the workstation baseline.')"),false,'status counter filters findings');await evaluate("document.querySelector('.report-counts button:not([data-status])').click()");assert.equal(await evaluate("document.body.innerText.includes('Checks the workstation baseline.')"),true,'All results clears the filter');

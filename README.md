@@ -139,7 +139,7 @@ cargo run -p baradwatchu-server
 
 Build the Angular dashboard with `(cd web && npm run build)` and open
 `http://localhost:3000`. Without `localOperatorName`, the Server uses `USER`, then
-`LOGNAME`/`USERNAME`, then the generic `Operatore locale` label. This is a descriptive label only:
+`LOGNAME`/`USERNAME`, then the generic `Local operator` label (`Operatore locale` when the Server language is Italian). This is a descriptive label only:
 loopback access does not authenticate the browser user, and a system service may resolve
 its own service account. LOCAL requires `127.0.0.1` or `::1`, HTTP localhost public URL,
 and any port; startup fails on wildcard/non-loopback bindings. Browser `Host` headers other than the
@@ -322,6 +322,13 @@ The Remote audits tab lists requests and saved reports as compact rows with Clie
 
 Reports survive Server restarts and the Client's one-hour remote cache expiration, until explicitly deleted. Only the requesting operator may access them, and OIDC still checks current admin authorization. Removing Client trust prevents new remote retrieval but leaves already received history available. Repeated retrieval is idempotent; changed content under the same request ID is rejected. Deletion is local to the Server; retrieving the remote result again can save a new copy. Comparisons use current Server expectations. Usage counts JSON payload bytes, not SQLite disk allocation; deletion releases logical records without guaranteeing an immediate database-file shrink. No automatic retention policy is configured.
 
+### Barad Policy: automatic change reports and policy SHA
+
+A company administrator may install a Barad Policy (`barad-policy.json`) locally on each workstation; see the Client README. The Server cannot download, push, change, activate or schedule it, and gains no remote policy management.
+
+- **Automatic change reports.** When the Client's policy enables `onChangeDetecting`, its system service runs periodic audits as the registered user and, only when the normalized security state changed (or for the first audit), sends the report on the existing authenticated tunnel (`POST /v1/change-reports`, announced by this Server in the tunnel acknowledgement as `accepts: ["CHANGE_REPORTS"]`). The Server checks that the Device ID is the tunnel's, that the initiator is `SCHEDULED` and that the report follows the audit contract, stores it once per `reportId` exactly as received and acknowledges it; the Client marks the state as delivered only after that acknowledgement. These reports belong to the fleet: every authorized administrator sees them in **Remote audits** with the **Automatic (Barad Policy)** tag, can open, print and delete them, and has no request controls for them. A Server never initiates or commands periodic audits.
+- **Policy SHA-256 comparison.** Every report (remote or automatic) from an updated Client carries `policy` with its state (`APPLIED`, `ABSENT`, `INVALID`, `UNTRUSTED`) and the SHA-256 of the bytes read. Settings → **Expected Barad Policy for the fleet** and, per trusted Client, **Set policy SHA** store administrator-supplied 64-digit values (from a verified source, e.g. `sha256sum barad-policy.json`); the Client value wins over the fleet one. The report modal shows `MATCH` only for an `APPLIED` policy with the expected digest; a different, missing, invalid or untrusted policy is a red `MISMATCH`; without an expectation the result is `UNKNOWN` (neutral). The expected value is never learned from a report. APIs: `PUT/DELETE /api/clients/{id}/policy-sha`, `GET/PUT/DELETE /api/barad-policy/expected-sha` (administrator session, CSRF). Removing a trusted Client removes its policy expectation. As for the other SHA checks, this is an integrity comparison of Client-reported evidence, not a signature.
+
 ## Linux source installation
 
 
@@ -378,6 +385,8 @@ newer toolchain. Full source reinstall/service deployment was not performed for 
 Build cache v2 still checks artifact hashes/glibc before reuse, without executing binaries in
 `--no-build`. Old caches need rebuilding. User data/configuration are preserved. Audit findings
 are observations from the trusted Client, not independent Server certification or remediation.
+
+Barad Policy (2026-11-14): change-report handling, policy SHA comparison and storage are unit-tested (in-memory tunnel frames, SQLite in memory); the Server dashboard was checked with a browser fixture. A live push from a real Client service over a real tunnel has not been run yet, and `web/dashboard.smoke.mjs` already failed on this checkout before the change (its fixture predates the custom-check and remote-audit-list UI).
 
 ## Requirements and roadmap
 

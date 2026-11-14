@@ -1,4 +1,8 @@
 //! Outbound Client connections. The dashboard never accepts network authentication here.
+//!
+//! The Server sends requests on the tunnel; a Client may send one kind of request of its own:
+//! `POST /v1/change-reports` (Barad Policy periodic audit whose security state changed). It is
+//! stored and acknowledged, never answered with a command.
 use crate::{http::App, storage::TrustedClient, tls};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use rustls::{
@@ -26,6 +30,11 @@ use std::{
 
 const MAX_FRAME: usize = 9 * 1024 * 1024;
 const PROTOCOL: &str = "baradwatchu.tunnel.v1";
+const CHANGE_REPORT_SCHEMA: &str = "baradwatchu.change-report.v1";
+const CHANGE_REPORT_ACK_SCHEMA: &str = "baradwatchu.change-report-ack.v1";
+pub const CHANGE_REPORT_PATH: &str = "/v1/change-reports";
+/// Announced in the tunnel acknowledgement: Clients send change reports only when present.
+const CHANGE_REPORT_FEATURE: &str = "CHANGE_REPORTS";
 
 pub struct Reply {
     pub code: u16,
@@ -65,6 +74,80 @@ struct Session {
     stream: Mutex<Stream>,
     next: AtomicU64,
     reported_name: String,
+    client_id: String,
+    /// Weak: the registry inside `App` holds the sessions.
+    app: std::sync::Weak<App>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ClientRequestFrame {
+    schema_version: String,
+    sequence: u64,
+    method: String,
+    path: String,
+    body: Option<Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ChangeReport {
+    schema_version: String,
+    report_id: String,
+    device_id: String,
+    /// The Client's normalized state digest (informative; the Server keeps the report).
+    #[allow(dead_code)]
+    state_sha256: String,
+    report: Value,
+}
+
+fn valid_report_id(id: &str) -> bool {
+    (8..=64).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// Stores a Client's automatic change report for every administrator (`storage::CLIENT_REPORTS`).
+pub fn receive_change_report(app: &App, client_id: &str, body: Option<Value>) -> Reply {
+    let error = |code: u16, error: &str| Reply {
+        code,
+        body: serde_json::json!({"schemaVersion": CHANGE_REPORT_ACK_SCHEMA, "error": error}),
+    };
+    let Some(change) = body.and_then(|body| serde_json::from_value::<ChangeReport>(body).ok())
+    else {
+        return error(400, "INVALID_CHANGE_REPORT");
+    };
+    if change.schema_version != CHANGE_REPORT_SCHEMA
+        || !valid_report_id(&change.report_id)
+        || change.device_id != client_id
+        || change.report["initiator"]["origin"] != "SCHEDULED"
+    {
+        return error(400, "INVALID_CHANGE_REPORT");
+    }
+    if crate::report_integrity::parse(&change.report).is_err() {
+        return error(400, "INVALID_CHANGE_REPORT");
+    }
+    let client = match app.store.clients() {
+        Ok(clients) => clients.into_iter().find(|client| client.id == client_id),
+        Err(_) => return error(503, "STORAGE_UNAVAILABLE"),
+    };
+    let Some(client) = client else {
+        return error(403, "CLIENT_NOT_TRUSTED");
+    };
+    match app.store.remember_report(
+        crate::storage::CLIENT_REPORTS,
+        &change.report_id,
+        &client,
+        &change.report,
+    ) {
+        Ok(()) => Reply {
+            code: 200,
+            body: serde_json::json!({"schemaVersion": CHANGE_REPORT_ACK_SCHEMA, "reportId": change.report_id, "stored": true}),
+        },
+        Err(reason) if reason == "RECEIVED_REPORT_CHANGED" => error(409, "REPORT_ID_REUSED"),
+        Err(_) => error(503, "STORAGE_UNAVAILABLE"),
+    }
 }
 
 #[derive(Default)]
@@ -157,7 +240,22 @@ impl Session {
                 body,
             },
         )?;
-        let reply: ResponseFrame = read_frame(&mut *stream)?;
+        // A Client request may arrive before our reply: answer it, then keep reading.
+        let reply = read_reply(&mut *stream, |request| {
+            match (request.method.as_str(), request.path.as_str()) {
+                ("POST", CHANGE_REPORT_PATH) => match self.app.upgrade() {
+                    Some(app) => receive_change_report(&app, &self.client_id, request.body),
+                    None => Reply {
+                        code: 503,
+                        body: serde_json::json!({"schemaVersion": PROTOCOL, "error": "SERVER_STOPPING"}),
+                    },
+                },
+                _ => Reply {
+                    code: 404,
+                    body: serde_json::json!({"schemaVersion": PROTOCOL, "error": "NOT_FOUND"}),
+                },
+            }
+        })?;
         if reply.schema_version != PROTOCOL
             || reply.sequence != sequence
             || !(100..600).contains(&reply.code)
@@ -168,6 +266,31 @@ impl Session {
             code: reply.code,
             body: reply.body,
         })
+    }
+}
+
+/// Reads frames until the reply to our request, answering the Client's own requests on the way.
+fn read_reply<S: Read + Write>(
+    stream: &mut S,
+    mut handle: impl FnMut(ClientRequestFrame) -> Reply,
+) -> Result<ResponseFrame, String> {
+    loop {
+        let frame: Value = read_frame(stream)?;
+        if frame.get("method").is_none() {
+            return serde_json::from_value(frame)
+                .map_err(|_| "invalid Client tunnel response".into());
+        }
+        let request: ClientRequestFrame = serde_json::from_value(frame)
+            .map_err(|_| "invalid Client tunnel request".to_owned())?;
+        if request.schema_version != PROTOCOL {
+            return Err("invalid Client tunnel request".into());
+        }
+        let sequence = request.sequence;
+        let answer = handle(request);
+        write_frame(
+            stream,
+            &serde_json::json!({"schemaVersion": PROTOCOL, "sequence": sequence, "code": answer.code, "body": answer.body}),
+        )?;
     }
 }
 
@@ -310,7 +433,7 @@ fn accept(app: Arc<App>, tcp: TcpStream) -> Result<(), String> {
         .ok_or("Client trust missing")?;
     write_frame(
         &mut stream,
-        &serde_json::json!({"schemaVersion":PROTOCOL,"connected":true}),
+        &serde_json::json!({"schemaVersion":PROTOCOL,"connected":true,"accepts":[CHANGE_REPORT_FEATURE]}),
     )?;
     let id = client.id;
     let public_key = client.public_key;
@@ -318,6 +441,8 @@ fn accept(app: Arc<App>, tcp: TcpStream) -> Result<(), String> {
         stream: Mutex::new(stream),
         next: AtomicU64::new(1),
         reported_name: hello.name,
+        client_id: id.clone(),
+        app: Arc::downgrade(&app),
     });
     app.tunnels
         .sessions
@@ -371,4 +496,212 @@ pub fn listen(app: Arc<App>, address: SocketAddr) -> Result<(), String> {
         }
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::{PublicIdentity, Store};
+    use ed25519_dalek::SigningKey;
+    use serde_json::json;
+
+    /// In-memory duplex: reads the scripted frames, records what is written.
+    struct Duplex {
+        input: std::io::Cursor<Vec<u8>>,
+        output: Vec<u8>,
+    }
+    impl Read for Duplex {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.input.read(buf)
+        }
+    }
+    impl Write for Duplex {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.output.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    fn frames(values: &[Value]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for value in values {
+            write_frame(&mut bytes, value).unwrap();
+        }
+        bytes
+    }
+
+    #[test]
+    fn client_requests_interleaved_with_a_reply_are_answered_then_the_reply_is_returned() {
+        let mut duplex = Duplex {
+            input: std::io::Cursor::new(frames(&[
+                json!({"schemaVersion": PROTOCOL, "sequence": 7, "method": "POST", "path": CHANGE_REPORT_PATH, "body": {"x": 1}}),
+                json!({"schemaVersion": PROTOCOL, "sequence": 3, "code": 200, "body": {"ok": true}}),
+            ])),
+            output: Vec::new(),
+        };
+        let mut seen = Vec::new();
+        let reply = read_reply(&mut duplex, |request| {
+            seen.push((
+                request.method.clone(),
+                request.path.clone(),
+                request.body.clone(),
+            ));
+            Reply {
+                code: 200,
+                body: json!({"stored": true}),
+            }
+        })
+        .unwrap();
+        assert_eq!((reply.sequence, reply.code), (3, 200));
+        assert_eq!(
+            seen,
+            vec![(
+                "POST".into(),
+                CHANGE_REPORT_PATH.into(),
+                Some(json!({"x": 1}))
+            )]
+        );
+        let answer: Value = read_frame(&mut std::io::Cursor::new(duplex.output)).unwrap();
+        assert_eq!(
+            answer,
+            json!({"schemaVersion": PROTOCOL, "sequence": 7, "code": 200, "body": {"stored": true}})
+        );
+        // A malformed Client request closes the tunnel.
+        let mut bad = Duplex {
+            input: std::io::Cursor::new(frames(&[
+                json!({"schemaVersion": "other", "sequence": 1, "method": "POST", "path": "/x", "body": null}),
+            ])),
+            output: Vec::new(),
+        };
+        assert!(read_reply(&mut bad, |_| Reply {
+            code: 200,
+            body: Value::Null
+        })
+        .is_err());
+    }
+
+    fn app_with_client() -> (Arc<App>, String) {
+        let app = App::new(
+            Store::memory(),
+            crate::config::Settings {
+                auth_mode: crate::config::AuthMode::Local,
+                public_url: "http://localhost:3000".into(),
+                google: None,
+                local_operator_name: None,
+                web_dir: None,
+            },
+        )
+        .unwrap();
+        app.store.generate("Server").unwrap();
+        let key = SigningKey::from_bytes(&[9; 32]).verifying_key().to_bytes();
+        let client = app
+            .store
+            .import(
+                PublicIdentity {
+                    schema_version: "baradwatchu.public-identity.v1".into(),
+                    role: "client".into(),
+                    algorithm: "Ed25519".into(),
+                    public_key: STANDARD.encode(key),
+                    id: None,
+                    name: None,
+                    fingerprint: None,
+                    created_at_unix_ms: None,
+                    executable_sha256: None,
+                },
+                "Workstation",
+                &crate::storage::fingerprint(&key),
+            )
+            .unwrap();
+        (app, client.id)
+    }
+
+    fn change(device: &str, id: &str, origin: &str) -> Value {
+        json!({
+            "schemaVersion": CHANGE_REPORT_SCHEMA,
+            "reportId": id,
+            "deviceId": device,
+            "stateSha256": "a".repeat(64),
+            "report": {"schemaVersion": "baradwatchu.audit.v1", "completedAtUnixMs": 5, "initiator": {"origin": origin},
+                "policy": {"state": "APPLIED", "path": "/etc/baradwatchu/barad-policy.json", "sha256": "b".repeat(64)}, "results": []}
+        })
+    }
+
+    #[test]
+    fn change_reports_are_stored_once_for_every_administrator() {
+        let (app, device) = app_with_client();
+        let stored = receive_change_report(
+            &app,
+            &device,
+            Some(change(&device, "auto-0001", "SCHEDULED")),
+        );
+        assert_eq!(stored.code, 200, "{:?}", stored.body);
+        assert_eq!(stored.body["reportId"], "auto-0001");
+        // Resent after a lost acknowledgement: same answer, one copy.
+        assert_eq!(
+            receive_change_report(
+                &app,
+                &device,
+                Some(change(&device, "auto-0001", "SCHEDULED"))
+            )
+            .code,
+            200
+        );
+        for operator in ["LOCAL", "https://accounts.google.com:123"] {
+            let history = app.store.history(operator).unwrap();
+            assert_eq!(history.len(), 1);
+            assert_eq!(history[0]["automatic"], true);
+            assert!(app
+                .store
+                .history_report(operator, "auto-0001")
+                .unwrap()
+                .is_some());
+        }
+        // Same ID, different content: refused.
+        let mut changed = change(&device, "auto-0001", "SCHEDULED");
+        changed["report"]["completedAtUnixMs"] = json!(6);
+        assert_eq!(
+            receive_change_report(&app, &device, Some(changed)).code,
+            409
+        );
+    }
+
+    #[test]
+    fn change_reports_must_come_from_the_tunnel_client_and_be_periodic_audits() {
+        let (app, device) = app_with_client();
+        assert_eq!(receive_change_report(&app, &device, None).code, 400);
+        assert_eq!(
+            receive_change_report(
+                &app,
+                &device,
+                Some(change("BWU-OTHER", "auto-0002", "SCHEDULED"))
+            )
+            .code,
+            400
+        );
+        assert_eq!(
+            receive_change_report(&app, &device, Some(change(&device, "auto-0003", "REMOTE"))).code,
+            400
+        );
+        assert_eq!(
+            receive_change_report(&app, &device, Some(change(&device, "x", "SCHEDULED"))).code,
+            400
+        );
+        let mut broken = change(&device, "auto-0004", "SCHEDULED");
+        broken["report"]["schemaVersion"] = json!("other");
+        assert_eq!(receive_change_report(&app, &device, Some(broken)).code, 400);
+        let mut extra = change(&device, "auto-0005", "SCHEDULED");
+        extra["command"] = json!("run");
+        assert_eq!(receive_change_report(&app, &device, Some(extra)).code, 400);
+        assert_eq!(
+            receive_change_report(
+                &app,
+                "BWU-UNKNOWN",
+                Some(change("BWU-UNKNOWN", "auto-0006", "SCHEDULED"))
+            )
+            .code,
+            403
+        );
+        assert!(app.store.history("LOCAL").unwrap().is_empty());
+    }
 }
